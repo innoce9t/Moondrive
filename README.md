@@ -26,15 +26,27 @@ removal goes to your system Trash, never a hard delete).
 - **↻ Scan history** — every scan is recorded, so you can watch a folder's size
   trend over time. Each entry shows a sparkline, the size delta since the last
   scan of that path, and a one-click rescan.
-- **🔍 Deep recursive scanner** — streams live progress (files, folders, size),
-  handles permission errors gracefully, and skips symlinks by default to avoid
-  loops.
+- **🔍 Deep, concurrent scanner** — walks the tree with **bounded-concurrency
+  I/O** (many `readdir`/`stat` calls in flight at once via a semaphore) instead
+  of one-at-a-time, which is dramatically faster on real drives where per-file
+  latency dominates — while the cap prevents file-descriptor exhaustion. Streams
+  live progress, tolerates permission errors, and skips symlinks by default.
 - **🗂 Largest files & duplicate finder** — instantly surface the biggest space
   hogs, and detect duplicate files (grouped by size + content fingerprint) with
   a one-click "reclaimable space" estimate.
 - **🤖 Gemini AI assistant** — chat with Google's Gemini about how to organise
   your drive. It sees only *aggregate* stats and the *names* of your largest
   items — **never file contents**.
+- **✨ AI auto-organize (one click)** — Gemini proposes a tidy set of subfolders
+  and assigns your loose files to them. You get a grouped **preview** with a
+  checkbox per move, apply exactly what you want, and there's a **one-click undo**
+  that moves everything back and removes the folders it created. Every proposed
+  move is validated against the real file listing and the sandbox before running.
+- **🧹 Junk & cache scanner** — instantly flags reclaimable clutter over the
+  scanned tree (no extra disk I/O): dependency caches (`node_modules`), build
+  artifacts (`build`/`dist`/`target`/`.next`…), temp files, logs, backups,
+  incomplete downloads, and system clutter (`.DS_Store`, `Thumbs.db`). Grouped by
+  type with a reclaimable-space total; select and trash.
 - **⭳ App updates (Windows / winget)** — check for available package upgrades
   via `winget`, pick exactly which apps to update, and upgrade them silently
   with live console output. Or upgrade everything in one click.

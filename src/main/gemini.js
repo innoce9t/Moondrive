@@ -144,4 +144,69 @@ Guidelines:
 - Keep answers tight and skimmable. Use short markdown lists and headers. No fluff.
 - When you cannot know something from the summary, say so instead of guessing.`;
 
-module.exports = { generate, buildScanSummary, SYSTEM_PROMPT, DEFAULT_MODEL };
+const ORGANIZE_SYSTEM_PROMPT = `You are Moondrive's auto-organiser. You are given the list of files directly inside one folder.
+Propose a tidy set of subfolders and assign each file to one. Respond with STRICT JSON only — no prose, no markdown fences.
+
+JSON shape:
+{
+  "folders": ["Images", "Documents", "Installers", ...],
+  "moves": [ { "file": "<exact file name from the input>", "folder": "<one of folders>", "reason": "<short>" } ]
+}
+
+Rules:
+- Only reference file names that appear in the input list. Never invent files.
+- Group by meaningful type/purpose (e.g. Images, Videos, Documents, Music, Archives, Installers, Code, Screenshots). Keep folder names short and human.
+- It is fine to leave a file unmoved by omitting it. Do not create more than 12 folders.
+- Do not propose deleting anything. Only moves into new subfolders of the current folder.`;
+
+/**
+ * Ask Gemini for an organisation plan for one folder's direct children.
+ * Returns { folders: string[], moves: [{file, folder, reason}] }.
+ * The caller MUST validate every referenced file against the real listing.
+ */
+async function proposeOrganization({ apiKey, model = DEFAULT_MODEL, folderName, files }) {
+  const list = files
+    .slice(0, 300)
+    .map((f) => `- ${f.name} [${f.category}, ${f.size} bytes]`)
+    .join('\n');
+
+  const userMsg = `Folder: ${folderName}\nFiles (${files.length}):\n${list}\n\nReturn the JSON plan.`;
+
+  const text = await generate({
+    apiKey,
+    model,
+    systemPrompt: ORGANIZE_SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: userMsg }],
+  });
+
+  const jsonText = stripJsonFences(text);
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (e) {
+    throw new Error('The AI returned a plan that could not be parsed. Try again.');
+  }
+  return {
+    folders: Array.isArray(parsed.folders) ? parsed.folders : [],
+    moves: Array.isArray(parsed.moves) ? parsed.moves : [],
+  };
+}
+
+function stripJsonFences(text) {
+  let t = text.trim();
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) t = fence[1].trim();
+  // Trim to the outermost JSON object if extra text sneaks in.
+  const first = t.indexOf('{');
+  const last = t.lastIndexOf('}');
+  if (first !== -1 && last !== -1) t = t.slice(first, last + 1);
+  return t;
+}
+
+module.exports = {
+  generate,
+  buildScanSummary,
+  proposeOrganization,
+  SYSTEM_PROMPT,
+  DEFAULT_MODEL,
+};

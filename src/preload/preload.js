@@ -26,6 +26,7 @@ const api = {
     start: (folderPath) => ipcRenderer.invoke('scan:start', folderPath),
     cancel: () => ipcRenderer.invoke('scan:cancel'),
     duplicates: () => ipcRenderer.invoke('scan:duplicates'),
+    junk: () => ipcRenderer.invoke('scan:junk'),
     onProgress: (cb) => {
       const listener = (_e, data) => cb(data);
       ipcRenderer.on('scan:progress', listener);
@@ -50,6 +51,13 @@ const api = {
 
   ai: {
     ask: (messages) => ipcRenderer.invoke('ai:ask', { messages }),
+  },
+
+  organize: {
+    propose: (folderPath) => ipcRenderer.invoke('organize:propose', folderPath),
+    apply: (moves) => ipcRenderer.invoke('organize:apply', moves),
+    undo: () => ipcRenderer.invoke('organize:undo'),
+    canUndo: () => ipcRenderer.invoke('organize:canUndo'),
   },
 
   system: {

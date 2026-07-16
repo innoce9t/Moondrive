@@ -328,6 +328,38 @@ input[type="checkbox"] { accent-color: var(--blue); width: 16px; height: 16px; c
 
 .empty-list { padding: 60px; text-align: center; color: var(--text-faint); font-size: 14px; }
 
+/* auto-organize modal */
+.organize-modal { width: 640px; max-width: 92vw; display: flex; flex-direction: column; max-height: 82vh; }
+.organize-head { margin-bottom: 8px; }
+.organize-body { flex: 1; overflow-y: auto; margin: 8px 0; min-height: 120px; }
+.organize-loading { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 40px 0; color: var(--text-dim); }
+.organize-loading .scan-spinner { width: 42px; height: 42px; }
+.organize-group { margin-bottom: 16px; }
+.organize-group-head {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 9px;
+  background: rgba(61,123,255,0.1); border: 1px solid var(--stroke); margin-bottom: 6px;
+}
+.organize-group-head .og-folder { font-weight: 600; font-size: 13.5px; }
+.organize-group-head .og-folder::before { content: '📁 '; }
+.organize-group-head .og-meta { margin-left: auto; font-size: 11.5px; color: var(--text-faint); }
+.organize-move { display: flex; align-items: center; gap: 10px; padding: 6px 10px; font-size: 12.5px; border-radius: 7px; }
+.organize-move:hover { background: rgba(61,123,255,0.06); }
+.organize-move .om-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.organize-move .om-reason { color: var(--text-faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+.organize-actions { margin-top: 6px; }
+.organize-result { text-align: center; padding: 20px; }
+.organize-result .or-big { font-size: 30px; margin-bottom: 8px; }
+
+/* junk list */
+.junk-group { border-bottom: 1px solid rgba(90,130,220,0.1); padding: 12px 14px; }
+.junk-group-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 13px; }
+.junk-badge { padding: 3px 9px; border-radius: 20px; background: rgba(53,224,160,0.14); color: var(--success); font-size: 11px; font-weight: 600; }
+.junk-file { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: 8px; font-size: 12.5px; transition: background 0.14s; }
+.junk-file:hover { background: rgba(61,123,255,0.06); }
+.junk-file .jf-path { flex: 1; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.junk-file .jf-kind { font-size: 10px; padding: 1px 7px; border-radius: 10px; background: rgba(90,120,200,0.18); color: var(--text-dim); }
+.junk-file .jf-size { font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; }
+
 /* treemap */
 #treemap-canvas { width: 100%; height: 100%; display: block; }
 .treemap-empty {

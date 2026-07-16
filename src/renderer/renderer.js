@@ -18,6 +18,8 @@ const state = {
   duplicates: null,
   updates: null, // { supported, items }
   startup: null, // { supported, items }
+  junk: null, // { groups, totalSize, totalCount }
+  organizePlan: null,
 };
 
 let graph = null;
@@ -253,7 +255,9 @@ async function startScan(folderPath) {
   state.scan = { root: result.root, stats: result.stats };
   state.navStack = [result.root];
   state.duplicates = null;
+  state.junk = null;
   $('#rescan-btn').disabled = false;
+  $('#organize-btn').disabled = false;
 
   updateTopStats();
   renderCurrentFolder();
@@ -1190,6 +1194,237 @@ async function clearHistory() {
 }
 
 // ------------------------------------------------------------
+// Junk & cache
+// ------------------------------------------------------------
+async function findJunkFiles() {
+  if (!state.scan) { toast('Run a scan first', 'info'); return; }
+  const btn = $('#find-junk');
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  $('#junk-summary').textContent = 'Scanning for caches, temp files and build artifacts…';
+  try {
+    state.junk = await md.scan.junk();
+    renderJunk();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Scan for junk';
+  }
+}
+
+function renderJunk() {
+  const res = state.junk;
+  const list = $('#junk-list');
+  list.innerHTML = '';
+  const groups = res ? res.groups : [];
+  $('#junk-summary').textContent = groups.length
+    ? `${formatNumber(res.totalCount)} items · about ${formatBytes(res.totalSize)} reclaimable`
+    : 'No obvious junk found. 🎉';
+
+  groups.forEach((g) => {
+    const div = document.createElement('div');
+    div.className = 'junk-group';
+    const head = document.createElement('div');
+    head.className = 'junk-group-head';
+    head.innerHTML = `<input type="checkbox" class="junk-group-check"> <span class="junk-badge">${g.count}</span> <strong>${escapeHtml(g.label)}</strong> · ${formatBytes(g.totalSize)}${g.truncated ? ' <span style="color:var(--text-faint)">(showing top 500)</span>' : ''}`;
+    div.appendChild(head);
+    g.items.forEach((it) => {
+      const row = document.createElement('div');
+      row.className = 'junk-file';
+      row.innerHTML = `
+        <input type="checkbox" data-path="${encodeURIComponent(it.path)}" data-size="${it.size}">
+        <span class="jf-kind">${it.kind}</span>
+        <span class="jf-path" title="${escapeHtml(it.path)}">${escapeHtml(it.path)}</span>
+        <span class="jf-size">${formatBytes(it.size)}</span>
+        <button class="row-btn reveal" title="Reveal">◎</button>`;
+      row.querySelector('.reveal').addEventListener('click', () => md.files.reveal(it.path));
+      row.querySelector('input').addEventListener('change', updateJunkSelection);
+      div.appendChild(row);
+    });
+    head.querySelector('.junk-group-check').addEventListener('change', (e) => {
+      div.querySelectorAll('.junk-file input').forEach((c) => (c.checked = e.target.checked));
+      updateJunkSelection();
+    });
+    list.appendChild(div);
+  });
+  updateJunkSelection();
+}
+
+function updateJunkSelection() {
+  const checked = $$('#junk-list .junk-file input:checked');
+  const total = checked.reduce((s, c) => s + Number(c.dataset.size || 0), 0);
+  const btn = $('#junk-trash-selected');
+  btn.disabled = checked.length === 0;
+  btn.textContent = checked.length ? `Trash ${checked.length} · ${formatBytes(total)}` : 'Trash selected';
+}
+
+async function trashSelectedJunk() {
+  const checked = $$('#junk-list .junk-file input:checked');
+  const paths = checked.map((c) => decodeURIComponent(c.dataset.path));
+  if (!paths.length) return;
+  const total = checked.reduce((s, c) => s + Number(c.dataset.size || 0), 0);
+  const ok = await confirmModal({
+    title: `Move ${paths.length} junk items to Trash?`,
+    body: `This frees about ${formatBytes(total)}. Everything goes to your system Trash and can be restored. Review that nothing important is selected.`,
+    confirmText: 'Move to Trash',
+  });
+  if (!ok) return;
+  const results = await md.files.trashMany(paths);
+  const okCount = results.filter((r) => r.ok).length;
+  results.filter((r) => r.ok).forEach((r) => removeFromTree(r.path));
+  // prune trashed items from the junk view
+  const trashed = new Set(results.filter((r) => r.ok).map((r) => r.path));
+  if (state.junk) {
+    state.junk.groups = state.junk.groups
+      .map((g) => {
+        const items = g.items.filter((i) => !trashed.has(i.path));
+        const removed = g.count - items.length;
+        return { ...g, items, count: g.count - removed, totalSize: items.reduce((s, i) => s + i.size, 0) };
+      })
+      .filter((g) => g.items.length);
+    state.junk.totalSize = state.junk.groups.reduce((s, g) => s + g.totalSize, 0);
+    state.junk.totalCount = state.junk.groups.reduce((s, g) => s + g.count, 0);
+  }
+  renderJunk();
+  afterMutation();
+  toast(`Moved ${okCount}/${paths.length} junk items to Trash`, okCount ? 'success' : 'error');
+}
+
+// ------------------------------------------------------------
+// AI auto-organize
+// ------------------------------------------------------------
+async function openOrganize() {
+  if (!state.scan) { toast('Run a scan first', 'info'); return; }
+  if (!state.settings.geminiApiKey) {
+    toast('Add your Gemini API key in Settings first', 'error', 4500);
+    switchView('settings');
+    return;
+  }
+  const folder = currentFolder();
+  const backdrop = $('#organize-backdrop');
+  backdrop.hidden = false;
+  $('#organize-loading').hidden = false;
+  $('#organize-plan').hidden = true;
+  $('#organize-apply').hidden = true;
+  $('#organize-title').textContent = 'AI organisation plan';
+  $('#organize-sub').textContent = `Planning a tidy structure for “${folder.name}”…`;
+
+  // Surface an existing undo (from a previous organise) even before planning.
+  const u = await md.organize.canUndo();
+  $('#organize-undo').hidden = !u.canUndo;
+
+  try {
+    const res = await md.organize.propose(folder.path);
+    if (!res.ok) {
+      $('#organize-loading').hidden = true;
+      $('#organize-plan').hidden = false;
+      $('#organize-plan').innerHTML = `<p class="setting-desc">${escapeHtml(res.error)}</p>`;
+      return;
+    }
+    state.organizePlan = res;
+    renderOrganizePlan(res);
+  } catch (e) {
+    $('#organize-loading').hidden = true;
+    $('#organize-plan').hidden = false;
+    $('#organize-plan').innerHTML = `<p class="setting-desc">${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function renderOrganizePlan(res) {
+  $('#organize-loading').hidden = true;
+  const plan = $('#organize-plan');
+  plan.hidden = false;
+  plan.innerHTML = '';
+
+  if (!res.moves.length) {
+    plan.innerHTML = '<p class="setting-desc">The AI didn’t suggest any moves for this folder — it may already be tidy.</p>';
+    return;
+  }
+  const folderCount = new Set(res.moves.map((m) => m.folder)).size;
+  $('#organize-sub').textContent = `${res.moves.length} of ${res.totalFiles} files → ${folderCount} new folder${folderCount === 1 ? '' : 's'}. Review and apply.`;
+
+  const byFolder = new Map();
+  res.moves.forEach((m, i) => {
+    if (!byFolder.has(m.folder)) byFolder.set(m.folder, []);
+    byFolder.get(m.folder).push({ ...m, idx: i });
+  });
+
+  byFolder.forEach((moves, folder) => {
+    const total = moves.reduce((s, m) => s + m.size, 0);
+    const g = document.createElement('div');
+    g.className = 'organize-group';
+    const head = document.createElement('div');
+    head.className = 'organize-group-head';
+    head.innerHTML = `<span class="og-folder">${escapeHtml(folder)}</span><span class="og-meta">${moves.length} files · ${formatBytes(total)}</span>`;
+    g.appendChild(head);
+    moves.forEach((m) => {
+      const row = document.createElement('div');
+      row.className = 'organize-move';
+      row.innerHTML = `
+        <input type="checkbox" checked data-idx="${m.idx}">
+        <span class="om-name">${escapeHtml(m.name)}</span>
+        <span class="om-reason" title="${escapeHtml(m.reason)}">${escapeHtml(m.reason)}</span>`;
+      row.querySelector('input').addEventListener('change', updateOrganizeApply);
+      g.appendChild(row);
+    });
+    plan.appendChild(g);
+  });
+
+  $('#organize-apply').hidden = false;
+  updateOrganizeApply();
+}
+
+function updateOrganizeApply() {
+  const checked = $$('#organize-plan input:checked');
+  const btn = $('#organize-apply');
+  btn.disabled = checked.length === 0;
+  btn.textContent = checked.length ? `Apply ${checked.length} moves` : 'Apply moves';
+}
+
+async function applyOrganize() {
+  const checked = $$('#organize-plan input:checked');
+  const moves = checked.map((c) => state.organizePlan.moves[Number(c.dataset.idx)]).filter(Boolean);
+  if (!moves.length) return;
+  const btn = $('#organize-apply');
+  btn.disabled = true;
+  btn.textContent = 'Applying…';
+
+  const res = await md.organize.apply(moves.map((m) => ({ from: m.from, to: m.to })));
+  const okCount = res.results.filter((r) => r.ok).length;
+  res.results.filter((r) => r.ok).forEach((r) => removeFromTree(r.from));
+  afterMutation();
+
+  $('#organize-plan').innerHTML = `
+    <div class="organize-result">
+      <div class="or-big">✨</div>
+      <p><strong>${okCount}</strong> of ${moves.length} files organised into subfolders.</p>
+      <p class="setting-desc">Rescan to see the new structure in the graph and treemap.</p>
+    </div>`;
+  $('#organize-apply').hidden = true;
+  $('#organize-undo').hidden = !res.canUndo;
+  toast(`Organised ${okCount} files into folders`, okCount ? 'success' : 'error');
+}
+
+async function undoOrganize() {
+  const btn = $('#organize-undo');
+  btn.disabled = true;
+  btn.textContent = 'Undoing…';
+  const res = await md.organize.undo();
+  btn.disabled = false;
+  btn.textContent = 'Undo last organise';
+  if (!res.ok) { toast(res.error || 'Nothing to undo', 'error'); return; }
+  const okCount = res.results.filter((r) => r.ok).length;
+  $('#organize-undo').hidden = true;
+  toast(`Undid ${okCount} moves — files restored`, 'success');
+  closeOrganize();
+}
+
+function closeOrganize() {
+  $('#organize-backdrop').hidden = true;
+}
+
+// ------------------------------------------------------------
 // View switching
 // ------------------------------------------------------------
 function switchView(view) {
@@ -1197,6 +1432,7 @@ function switchView(view) {
   $$('.view').forEach((v) => v.classList.toggle('active', v.dataset.view === view));
   if (view === 'largest') renderLargest();
   if (view === 'duplicates' && !state.duplicates) $('#dupes-summary').textContent = 'Click “Find duplicates” to scan for repeated files.';
+  if (view === 'junk' && !state.junk) $('#junk-summary').textContent = 'Click “Scan for junk” to find caches, temp files and build artifacts.';
   if (view === 'updates' && !state.updates) checkUpdates();
   if (view === 'startup' && !state.startup) refreshStartup();
   if (view === 'history') loadHistory();
@@ -1257,6 +1493,16 @@ function bindUI() {
   // history
   $('#history-clear').addEventListener('click', clearHistory);
 
+  // junk
+  $('#find-junk').addEventListener('click', findJunkFiles);
+  $('#junk-trash-selected').addEventListener('click', trashSelectedJunk);
+
+  // auto-organize
+  $('#organize-btn').addEventListener('click', openOrganize);
+  $('#organize-cancel').addEventListener('click', closeOrganize);
+  $('#organize-apply').addEventListener('click', applyOrganize);
+  $('#organize-undo').addEventListener('click', undoOrganize);
+
   // chat
   $('#chat-form').addEventListener('submit', (e) => {
     e.preventDefault();
@@ -1284,9 +1530,12 @@ function bindUI() {
     toast('Symlink preference saved', 'info');
   });
 
-  // keyboard: Escape closes modal / clears selection
+  // keyboard: Escape closes whichever modal is open
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('#modal-backdrop').hidden) $('#modal-cancel').click();
+    if (e.key !== 'Escape') return;
+    if (!$('#modal-backdrop').hidden) $('#modal-cancel').click();
+    else if (!$('#prompt-backdrop').hidden) $('#prompt-cancel').click();
+    else if (!$('#organize-backdrop').hidden) closeOrganize();
   });
 }
 

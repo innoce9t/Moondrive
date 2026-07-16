@@ -6,7 +6,7 @@ const os = require('os');
 const fs = require('fs');
 const fsp = fs.promises;
 
-const { ScanSession, findDuplicates } = require('./scanner');
+const { ScanSession, findDuplicates, findJunk } = require('./scanner');
 const gemini = require('./gemini');
 const { Store } = require('./store');
 const systemTools = require('./system-tools');
@@ -20,6 +20,8 @@ let store = null;
 let activeScan = null;
 /** Last completed scan result — kept in main so AI/duplicate calls can reuse it. */
 let lastScan = null;
+/** Last applied auto-organise batch, for one-click undo. */
+let lastOrganizeBatch = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -177,6 +179,106 @@ function registerIpc() {
     return findDuplicates(lastScan.root);
   });
 
+  ipcMain.handle('scan:junk', async () => {
+    if (!lastScan) throw new Error('Run a scan first.');
+    return findJunk(lastScan.root);
+  });
+
+  // --- AI auto-organise ---------------------------------------------------
+  ipcMain.handle('organize:propose', async (_e, folderPath) => {
+    if (!lastScan) throw new Error('Run a scan first.');
+    const apiKey = store.get('geminiApiKey');
+    if (!apiKey) return { ok: false, error: 'Add your Gemini API key in Settings first.' };
+
+    const folder = findNodeByPath(lastScan.root, folderPath) || lastScan.root;
+    const files = (folder.children || []).filter((c) => c.type === 'file');
+    if (!files.length) return { ok: false, error: 'This folder has no loose files to organise.' };
+
+    let plan;
+    try {
+      plan = await gemini.proposeOrganization({
+        apiKey,
+        model: store.get('geminiModel') || gemini.DEFAULT_MODEL,
+        folderName: folder.name || folderPath,
+        files: files.map((f) => ({ name: f.name, category: f.category, size: f.size })),
+      });
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+
+    // Validate every proposed move against the real file listing + sandbox.
+    const byName = new Map(files.map((f) => [f.name, f]));
+    const seen = new Set();
+    const moves = [];
+    for (const m of plan.moves) {
+      const file = byName.get(m.file);
+      if (!file || seen.has(m.file)) continue;
+      const subfolder = sanitizeFolderName(m.folder);
+      if (!subfolder) continue;
+      const to = path.join(folderPath, subfolder, file.name);
+      if (path.resolve(to) === path.resolve(file.path)) continue; // no-op
+      if (!store.isPathAllowed(to)) continue;
+      seen.add(m.file);
+      moves.push({ from: file.path, to, name: file.name, folder: subfolder, size: file.size, reason: String(m.reason || '').slice(0, 140) });
+    }
+    return { ok: true, folderPath, moves, totalFiles: files.length };
+  });
+
+  ipcMain.handle('organize:apply', async (_e, moves) => {
+    const results = [];
+    const done = [];
+    for (const mv of moves) {
+      if (!store.isPathAllowed(mv.from) || !store.isPathAllowed(mv.to)) {
+        results.push({ from: mv.from, ok: false, error: 'outside sandbox' });
+        continue;
+      }
+      try {
+        await fsp.mkdir(path.dirname(mv.to), { recursive: true });
+        await fsp.rename(mv.from, mv.to);
+        results.push({ from: mv.from, to: mv.to, ok: true });
+        done.push({ from: mv.from, to: mv.to });
+      } catch (e) {
+        results.push({ from: mv.from, ok: false, error: e.message });
+      }
+    }
+    // Record for undo (reverse direction).
+    lastOrganizeBatch = done.length ? { moves: done } : null;
+    return { ok: true, results, canUndo: !!lastOrganizeBatch };
+  });
+
+  ipcMain.handle('organize:undo', async () => {
+    if (!lastOrganizeBatch) return { ok: false, error: 'Nothing to undo.' };
+    const results = [];
+    const createdDirs = new Set();
+    for (const mv of lastOrganizeBatch.moves) {
+      if (!store.isPathAllowed(mv.from) || !store.isPathAllowed(mv.to)) {
+        results.push({ ok: false, error: 'outside sandbox' });
+        continue;
+      }
+      try {
+        await fsp.mkdir(path.dirname(mv.from), { recursive: true });
+        await fsp.rename(mv.to, mv.from); // move back
+        createdDirs.add(path.dirname(mv.to));
+        results.push({ ok: true });
+      } catch (e) {
+        results.push({ ok: false, error: e.message });
+      }
+    }
+    // Clean up now-empty folders the organise step created.
+    for (const dir of createdDirs) {
+      try {
+        const remaining = await fsp.readdir(dir);
+        if (!remaining.length) await fsp.rmdir(dir);
+      } catch (e) {
+        /* leave non-empty dirs alone */
+      }
+    }
+    lastOrganizeBatch = null;
+    return { ok: true, results };
+  });
+
+  ipcMain.handle('organize:canUndo', () => ({ canUndo: !!lastOrganizeBatch }));
+
   // --- File operations (all sandbox-gated) --------------------------------
   ipcMain.handle('fs:trash', async (_e, targetPath) => {
     if (!store.isPathAllowed(targetPath)) {
@@ -296,6 +398,32 @@ function registerIpc() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function findNodeByPath(root, target) {
+  if (!root) return null;
+  if (path.resolve(root.path) === path.resolve(target)) return root;
+  if (root.children) {
+    for (const c of root.children) {
+      if (c.type === 'dir') {
+        const found = findNodeByPath(c, target);
+        if (found) return found;
+      }
+    }
+  }
+  return null;
+}
+
+/** Strip anything path-like or unsafe from an AI-proposed folder name. */
+function sanitizeFolderName(name) {
+  if (!name || typeof name !== 'string') return '';
+  const clean = name
+    .replace(/[\\/:*?"<>|]/g, '')
+    .replace(/\.\.+/g, '')
+    .trim()
+    .slice(0, 60);
+  if (!clean || clean === '.' || clean === '..') return '';
+  return clean;
+}
 
 function getSystemRoots() {
   if (process.platform === 'win32') {
