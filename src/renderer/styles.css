@@ -588,6 +588,17 @@ input[type="checkbox"] { accent-color: var(--blue); width: 16px; height: 16px; c
 }
 .field input:focus, .field select:focus { border-color: var(--stroke-strong); }
 .key-row { display: flex; gap: 8px; } .key-row input { flex: 1; }
+.slider-row { display: flex; align-items: center; gap: 14px; }
+.slider-row input[type="range"] {
+  flex: 1; -webkit-appearance: none; appearance: none; height: 5px; border-radius: 4px;
+  background: linear-gradient(90deg, var(--blue), var(--cyan)); outline: none;
+}
+.slider-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 18px; height: 18px; border-radius: 50%;
+  background: #eaf1ff; border: 2px solid var(--blue-bright); cursor: pointer;
+  box-shadow: 0 0 10px rgba(61,123,255,0.6);
+}
+.slider-val { min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--blue-bright); font-size: 13px; }
 .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; font-size: 13px; }
 .switch-row small { color: var(--text-faint); font-size: 11px; }
 .setting-actions { display: flex; gap: 10px; }

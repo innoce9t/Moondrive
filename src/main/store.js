@@ -24,6 +24,7 @@ class Store {
       fastRescan: false,
       useWorkers: false,
       watchDrive: false,
+      graphSpacing: 1, // node-graph orbit distance multiplier
       scanHistory: [], // [{ path, timestamp, files, dirs, totalSize, byCategory }]
     };
     this._load();

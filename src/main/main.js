@@ -89,6 +89,7 @@ function registerIpc() {
       'fastRescan',
       'useWorkers',
       'watchDrive',
+      'graphSpacing',
     ];
     if (!allowed.includes(key)) throw new Error(`Setting "${key}" is not writable.`);
     store.set(key, value);

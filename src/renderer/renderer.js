@@ -812,6 +812,11 @@ function hydrateSettings() {
   $('#fast-rescan').checked = !!s.fastRescan;
   $('#watch-drive').checked = !!s.watchDrive;
   $('#scan-concurrency').value = s.scanConcurrency || 48;
+
+  const spacing = s.graphSpacing || 1;
+  $('#graph-spacing').value = spacing;
+  $('#graph-spacing-val').textContent = `${Number(spacing).toFixed(1)}×`;
+  if (graph) graph.setSpacing(spacing);
 }
 
 async function saveAiSettings() {
@@ -1779,6 +1784,15 @@ function bindUI() {
     e.target.value = v;
     state.settings = await md.settings.set('scanConcurrency', v);
     toast('Scan concurrency saved', 'info', 1600);
+  });
+  // Node-graph spacing: update live while dragging, persist on release.
+  $('#graph-spacing').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('#graph-spacing-val').textContent = `${v.toFixed(1)}×`;
+    if (graph) graph.setSpacing(v);
+  });
+  $('#graph-spacing').addEventListener('change', async (e) => {
+    state.settings = await md.settings.set('graphSpacing', Number(e.target.value));
   });
 
   // keyboard: Escape closes whichever modal is open

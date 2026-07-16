@@ -51,6 +51,7 @@ class MoonGraph {
     this.view = { x: 0, y: 0, scale: 1 };
     this.selected = null;
     this.hovered = null;
+    this.spacing = 1; // multiplier for how far nodes orbit from the hub
 
     this._drag = null; // { node, offsetX, offsetY } or { panning:true }
     this._raf = null;
@@ -168,6 +169,18 @@ class MoonGraph {
   zoomOut() { this.zoomBy(1 / 1.2); }
   resetView() { this.view = { x: 0, y: 0, scale: 1 }; }
 
+  /** Set how far nodes orbit the hub (1 = default). Nudges the layout so the
+   *  change is visible immediately without waiting for a rescan. */
+  setSpacing(mult) {
+    const v = Math.max(0.5, Math.min(3, Number(mult) || 1));
+    this.spacing = v;
+    // give the settled cloud a little energy so it re-expands/contracts
+    for (const nd of this.nodes) {
+      nd.vx += (Math.random() - 0.5) * 0.5;
+      nd.vy += (Math.random() - 0.5) * 0.5;
+    }
+  }
+
   // ---- coordinate helpers ----
   _toWorld(sx, sy) {
     return {
@@ -194,8 +207,10 @@ class MoonGraph {
   _simulate() {
     const nodes = this.nodes;
     const n = nodes.length;
-    const centerPull = 0.012;
-    const repel = 2600;
+    // Higher `spacing` weakens center gravity and strengthens repulsion, so the
+    // whole cloud settles further from the hub.
+    const centerPull = 0.012 / this.spacing;
+    const repel = 2600 * this.spacing;
 
     const hubR = this.hub ? this.hub.r : 30;
     for (let i = 0; i < n; i++) {
@@ -209,7 +224,7 @@ class MoonGraph {
       let hdy = a.y - this.cy;
       let hdist = Math.hypot(hdx, hdy);
       if (hdist < 0.01) { hdx = Math.random() - 0.5; hdy = Math.random() - 0.5; hdist = 1; }
-      const minOrbit = hubR + a.r + 22;
+      const minOrbit = hubR + a.r + 22 + (this.spacing - 1) * 90;
       if (hdist < minOrbit) {
         const push = (minOrbit - hdist) * 0.35;
         a.vx += (hdx / hdist) * push;
