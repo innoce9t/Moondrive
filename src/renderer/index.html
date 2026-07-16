@@ -49,6 +49,9 @@
         <button class="nav-item" data-view="startup">
           <span class="nav-ico">⏻</span> Startup apps
         </button>
+        <button class="nav-item" data-view="apps">
+          <span class="nav-ico">🗑</span> Uninstall apps
+        </button>
         <button class="nav-item" data-view="settings">
           <span class="nav-ico">⚙</span> Settings
         </button>
@@ -284,6 +287,20 @@
         </div>
         <div id="startup-summary" class="dupes-summary"></div>
         <div class="table-wrap"><table class="data-table" id="startup-table"><tbody></tbody></table></div>
+      </section>
+
+      <!-- View: Uninstall apps -->
+      <section class="view view-list" data-view="apps">
+        <div class="list-head">
+          <h2>Uninstall apps <span class="win-tag">Windows</span></h2>
+          <div class="list-tools">
+            <input type="text" id="apps-filter" class="filter-input" placeholder="Filter apps…" />
+            <button class="ghost-btn" id="refresh-apps">Refresh</button>
+          </div>
+        </div>
+        <div id="apps-summary" class="dupes-summary"></div>
+        <div class="table-wrap"><table class="data-table" id="apps-table"><tbody></tbody></table></div>
+        <div class="console-out" id="apps-console" hidden></div>
       </section>
 
       <!-- View: Settings -->

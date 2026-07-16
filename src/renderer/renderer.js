@@ -20,6 +20,8 @@ const state = {
   startup: null, // { supported, items }
   junk: null, // { groups, totalSize, totalCount }
   organizePlan: null,
+  apps: null, // { supported, items }
+  appsFilter: '',
 };
 
 let graph = null;
@@ -151,6 +153,7 @@ async function init() {
   bindUI();
   bindScanProgress();
   bindWingetProgress();
+  bindAppsProgress();
   hydrateSettings();
 }
 
@@ -1194,6 +1197,128 @@ async function clearHistory() {
 }
 
 // ------------------------------------------------------------
+// Uninstall apps (Windows)
+// ------------------------------------------------------------
+async function refreshApps() {
+  const btn = $('#refresh-apps');
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  $('#apps-summary').textContent = 'Reading installed programs…';
+  try {
+    state.apps = await md.apps.list();
+    renderApps();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Refresh';
+  }
+}
+
+function renderApps() {
+  const res = state.apps;
+  const tbody = $('#apps-table').querySelector('tbody');
+  tbody.innerHTML = '';
+
+  if (!res || !res.supported) {
+    $('#apps-summary').textContent = '';
+    unsupportedRow('#apps-table', '⊘', (res && res.reason) || 'Uninstalling apps is only available on Windows.');
+    return;
+  }
+  if (res.error) {
+    $('#apps-summary').textContent = '';
+    unsupportedRow('#apps-table', '⚠', res.error);
+    return;
+  }
+
+  const filter = state.appsFilter.trim().toLowerCase();
+  const all = (res.items || []).slice().sort((a, b) => (b.size || 0) - (a.size || 0));
+  const items = filter
+    ? all.filter((a) => a.name.toLowerCase().includes(filter) || (a.publisher || '').toLowerCase().includes(filter))
+    : all;
+
+  $('#apps-summary').textContent = filter
+    ? `${items.length} of ${all.length} apps`
+    : `${all.length} installed app${all.length === 1 ? '' : 's'}`;
+
+  if (!items.length) {
+    unsupportedRow('#apps-table', '🔍', 'No apps match your filter.');
+    return;
+  }
+
+  items.forEach((app) => {
+    const tr = document.createElement('tr');
+    tr.dataset.id = app.id;
+    tr.innerHTML = `
+      <td>
+        <div class="file-name-cell">
+          <div class="app-icon">${escapeHtml(initials(app.name))}</div>
+          <div style="min-width:0">
+            <div class="file-name">${escapeHtml(app.name)}</div>
+            <div class="app-pub">${escapeHtml(app.publisher || 'Unknown publisher')}${app.scope === 'user' ? ' · user' : ''}</div>
+          </div>
+        </div>
+      </td>
+      <td class="app-ver">${escapeHtml(app.version || '')}</td>
+      <td><span class="size-text">${app.size ? formatBytes(app.size) : '—'}</span></td>
+      <td class="cell-actions"><button class="uninstall-btn">Uninstall</button></td>`;
+    tr.querySelector('.uninstall-btn').addEventListener('click', () => uninstallApp(app, tr));
+    tbody.appendChild(tr);
+  });
+}
+
+function initials(name) {
+  const words = String(name).replace(/[^\w\s]/g, ' ').trim().split(/\s+/);
+  return ((words[0]?.[0] || '') + (words[1]?.[0] || '')).toUpperCase() || '▦';
+}
+
+async function uninstallApp(app, tr) {
+  const ok = await confirmModal({
+    title: `Uninstall ${app.name}?`,
+    body: `This runs ${app.name}'s uninstaller${app.publisher ? ` from ${app.publisher}` : ''}. Some uninstallers open their own window to finish. This cannot be undone from Moondrive.`,
+    confirmText: 'Uninstall',
+  });
+  if (!ok) return;
+
+  const btn = tr.querySelector('.uninstall-btn');
+  btn.disabled = true;
+  btn.textContent = 'Uninstalling…';
+  const consoleEl = $('#apps-console');
+  consoleEl.hidden = false;
+
+  const res = await md.apps.uninstall(app.id);
+  if (!res.supported) {
+    toast(res.reason || 'Not supported', 'error');
+    btn.disabled = false;
+    btn.textContent = 'Uninstall';
+    return;
+  }
+  if (res.ok) {
+    toast(`Uninstalled ${app.name}`, 'success');
+    tr.style.opacity = '0.4';
+    btn.textContent = 'Removed';
+    // Drop it from the cached list and refresh shortly.
+    if (state.apps) state.apps.items = state.apps.items.filter((a) => a.id !== app.id);
+    setTimeout(refreshApps, 1500);
+  } else {
+    toast(`Could not uninstall ${app.name}${res.code ? ` (exit ${res.code})` : ''}. It may need administrator rights.`, 'error', 5500);
+    btn.disabled = false;
+    btn.textContent = 'Uninstall';
+  }
+}
+
+function bindAppsProgress() {
+  md.apps.onProgress(({ line }) => {
+    const consoleEl = $('#apps-console');
+    consoleEl.hidden = false;
+    const div = document.createElement('div');
+    div.textContent = line;
+    consoleEl.appendChild(div);
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  });
+}
+
+// ------------------------------------------------------------
 // Junk & cache
 // ------------------------------------------------------------
 async function findJunkFiles() {
@@ -1435,6 +1560,7 @@ function switchView(view) {
   if (view === 'junk' && !state.junk) $('#junk-summary').textContent = 'Click “Scan for junk” to find caches, temp files and build artifacts.';
   if (view === 'updates' && !state.updates) checkUpdates();
   if (view === 'startup' && !state.startup) refreshStartup();
+  if (view === 'apps' && !state.apps) refreshApps();
   if (view === 'history') loadHistory();
   if (view === 'treemap' && treemap) {
     // The canvas has no size while hidden — measure and lay out now it's visible.
@@ -1486,6 +1612,13 @@ function bindUI() {
 
   // startup apps
   $('#refresh-startup').addEventListener('click', refreshStartup);
+
+  // uninstall apps
+  $('#refresh-apps').addEventListener('click', refreshApps);
+  $('#apps-filter').addEventListener('input', (e) => {
+    state.appsFilter = e.target.value;
+    if (state.apps) renderApps();
+  });
 
   // treemap
   $('#treemap-up').addEventListener('click', () => onNodeEnter({ _up: true }));

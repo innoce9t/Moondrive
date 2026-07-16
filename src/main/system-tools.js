@@ -261,6 +261,112 @@ async function setStartupApp(entry, enable) {
   return { supported: true, ok: true };
 }
 
+// ------------------------------------------------------------
+// Installed apps (list + uninstall) — Windows
+// ------------------------------------------------------------
+const LIST_APPS_SCRIPT = `
+$ErrorActionPreference = 'SilentlyContinue'
+$paths = @(
+  'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',
+  'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',
+  'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'
+)
+$apps = foreach ($p in $paths) { Get-ItemProperty $p -ErrorAction SilentlyContinue }
+$apps |
+  Where-Object {
+    $_.DisplayName -and $_.UninstallString -and
+    -not $_.SystemComponent -and
+    ($_.ReleaseType -notin @('Security Update','Update Rollup','Hotfix')) -and
+    -not $_.ParentKeyName
+  } |
+  ForEach-Object {
+    $scope = if ($_.PSPath -match 'HKEY_CURRENT_USER') { 'user' } else { 'machine' }
+    [pscustomobject]@{
+      name        = $_.DisplayName
+      version     = $_.DisplayVersion
+      publisher   = $_.Publisher
+      installDate = $_.InstallDate
+      size        = if ($_.EstimatedSize) { [int64]$_.EstimatedSize * 1024 } else { 0 }
+      uninstall   = $_.UninstallString
+      quiet       = $_.QuietUninstallString
+      location    = $_.InstallLocation
+      key         = $_.PSChildName
+      scope       = $scope
+    }
+  } |
+  Sort-Object name -Unique |
+  ConvertTo-Json -Depth 3 -Compress
+`;
+
+async function listInstalledApps() {
+  if (!IS_WIN) return { supported: false, reason: 'Uninstalling apps is only available on Windows.', items: [] };
+  const res = await ps(LIST_APPS_SCRIPT, 45000);
+  if (res.code !== 0) {
+    return { supported: true, items: [], error: (res.stderr || 'Could not read installed apps.').trim() };
+  }
+  let parsed = [];
+  try {
+    const out = (res.stdout || '').trim();
+    if (out) {
+      const json = JSON.parse(out);
+      parsed = Array.isArray(json) ? json : [json];
+    }
+  } catch (e) {
+    return { supported: true, items: [], error: 'Could not parse installed apps.' };
+  }
+  // Assign a stable composite id and keep only the fields the UI needs.
+  const items = parsed.map((a) => ({
+    id: `${a.scope}|${a.key}`,
+    name: a.name,
+    version: a.version || '',
+    publisher: a.publisher || '',
+    installDate: a.installDate || '',
+    size: a.size || 0,
+    scope: a.scope,
+    _uninstall: a.uninstall || '',
+    _quiet: a.quiet || '',
+  }));
+  return { supported: true, items };
+}
+
+/** Turn an app's registry uninstall string into a runnable command. */
+function buildUninstallCommand(app) {
+  const str = app._quiet || app._uninstall;
+  if (!str) return null;
+  // MSI products: rewrite the install/repair invocation into a silent uninstall.
+  if (/msiexec/i.test(str)) {
+    const guid = str.match(/\{[0-9A-Fa-f-]{36}\}/);
+    if (guid) return `msiexec.exe /x ${guid[0]} /quiet /norestart`;
+  }
+  // Otherwise run the vendor uninstaller. QuietUninstallString (when present) is
+  // silent; a plain UninstallString may open the vendor's own uninstaller UI.
+  return str;
+}
+
+async function uninstallApp(app, onLine) {
+  if (!IS_WIN) return { supported: false, reason: 'Uninstalling apps is only available on Windows.' };
+  const cmd = buildUninstallCommand(app);
+  if (!cmd) return { supported: true, ok: false, error: 'No uninstall command is registered for this app.' };
+
+  return new Promise((resolve) => {
+    const child = spawn('cmd.exe', ['/c', cmd], { windowsHide: true });
+    let buf = '';
+    const push = (chunk) => {
+      buf += chunk.toString();
+      const parts = buf.split(/\r?\n/);
+      buf = parts.pop();
+      for (const line of parts) {
+        const clean = line.split('\r').pop();
+        if (clean && clean.trim()) onLine && onLine(clean);
+      }
+    };
+    child.stdout.on('data', push);
+    child.stderr.on('data', push);
+    child.on('error', (e) => resolve({ supported: true, ok: false, error: e.message }));
+    child.on('close', (code) => resolve({ supported: true, ok: code === 0, code }));
+  });
+}
+
 module.exports = {
   IS_WIN,
   wingetAvailable,
@@ -269,4 +375,6 @@ module.exports = {
   parseWingetUpgrade, // exported for testing
   listStartupApps,
   setStartupApp,
+  listInstalledApps,
+  uninstallApp,
 };

@@ -54,6 +54,11 @@ removal goes to your system Trash, never a hard delete).
   (registry Run keys + startup folders, per-user and machine-wide) and flip each
   on/off with a toggle. Uses the same non-destructive StartupApproved mechanism
   as Task Manager — it never deletes your Run entries or shortcuts.
+- **🗑 App uninstaller (Windows)** — lists everything in "Add/Remove Programs"
+  (read from the registry Uninstall keys, not just winget packages), sorted by
+  size with a filter box, and uninstalls via each app's own uninstaller
+  (silent/MSI-aware where possible). For safety the main process caches the list
+  and uninstalls **by id** — the renderer never handles a raw command line.
 - **🛡 Sandboxed by design** — Moondrive can only read or modify folders you
   explicitly grant. There's an optional, clearly-warned "grant root access" for
   power users. Every filesystem mutation passes through a single allow-list gate

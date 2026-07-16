@@ -22,6 +22,8 @@ let activeScan = null;
 let lastScan = null;
 /** Last applied auto-organise batch, for one-click undo. */
 let lastOrganizeBatch = null;
+/** Cache of installed apps by id, so uninstall runs by id (never a renderer-supplied command). */
+const installedAppsById = new Map();
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -379,6 +381,30 @@ function registerIpc() {
   // --- Startup apps -------------------------------------------------------
   ipcMain.handle('startup:list', () => systemTools.listStartupApps());
   ipcMain.handle('startup:set', (_e, { entry, enable }) => systemTools.setStartupApp(entry, enable));
+
+  // --- Installed apps (uninstall) ----------------------------------------
+  ipcMain.handle('apps:list', async () => {
+    const res = await systemTools.listInstalledApps();
+    // Cache the full entries (incl. uninstall strings) so uninstall works by id
+    // and the renderer never handles or supplies a raw command line.
+    installedAppsById.clear();
+    if (res.items) {
+      for (const a of res.items) installedAppsById.set(a.id, a);
+    }
+    // Strip internal command fields before sending to the renderer.
+    const items = (res.items || []).map(({ _uninstall, _quiet, ...pub }) => pub);
+    return { ...res, items };
+  });
+
+  ipcMain.handle('apps:uninstall', async (_e, id) => {
+    const app = installedAppsById.get(id);
+    if (!app) return { ok: false, error: 'Unknown app — refresh the list and try again.' };
+    return systemTools.uninstallApp(app, (line) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('apps:progress', { id, line });
+      }
+    });
+  });
 
   // --- Scan history -------------------------------------------------------
   ipcMain.handle('history:list', () => store.getScanHistory());

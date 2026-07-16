@@ -79,6 +79,16 @@ const api = {
     list: () => ipcRenderer.invoke('startup:list'),
     set: (entry, enable) => ipcRenderer.invoke('startup:set', { entry, enable }),
   },
+
+  apps: {
+    list: () => ipcRenderer.invoke('apps:list'),
+    uninstall: (id) => ipcRenderer.invoke('apps:uninstall', id),
+    onProgress: (cb) => {
+      const listener = (_e, data) => cb(data);
+      ipcRenderer.on('apps:progress', listener);
+      return () => ipcRenderer.removeListener('apps:progress', listener);
+    },
+  },
 };
 
 contextBridge.exposeInMainWorld('moondrive', api);
