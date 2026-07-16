@@ -18,6 +18,14 @@ removal goes to your system Trash, never a hard delete).
   Nodes are sized by byte-weight and coloured by category (video, image, audio,
   documents, code, archives, executables…). Pan, zoom, drag nodes, and
   **double-click a folder to drill into it**; breadcrumbs let you jump back out.
+- **▦ Treemap view** — a squarified space-filling map of the current folder, the
+  classic "where did my disk go" view. Shares the same drill-in navigation as
+  the graph; click a tile to inspect, double-click a folder to descend.
+- **✏️ Rename & move** — rename any file or folder in place, or move it into
+  another granted folder, straight from the details panel (sandbox-enforced).
+- **↻ Scan history** — every scan is recorded, so you can watch a folder's size
+  trend over time. Each entry shows a sparkline, the size delta since the last
+  scan of that path, and a one-click rescan.
 - **🔍 Deep recursive scanner** — streams live progress (files, folders, size),
   handles permission errors gracefully, and skips symlinks by default to avoid
   loops.
@@ -59,6 +67,7 @@ src/
     ├── index.html        Dashboard layout
     ├── styles.css        Black & blue theme + animations
     ├── graph.js          Canvas force-directed node graph (MoonGraph)
+    ├── treemap.js        Squarified treemap on canvas (MoonTreemap)
     └── renderer.js        App logic, views, navigation, AI chat
 ```
 

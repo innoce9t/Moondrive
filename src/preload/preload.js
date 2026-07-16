@@ -40,6 +40,12 @@ const api = {
     open: (p) => ipcRenderer.invoke('fs:open', p),
     createFolder: (parent, name) => ipcRenderer.invoke('fs:createFolder', { parent, name }),
     move: (from, to) => ipcRenderer.invoke('fs:move', { from, to }),
+    pickDestination: () => ipcRenderer.invoke('fs:pickDestination'),
+  },
+
+  history: {
+    list: () => ipcRenderer.invoke('history:list'),
+    clear: () => ipcRenderer.invoke('history:clear'),
   },
 
   ai: {

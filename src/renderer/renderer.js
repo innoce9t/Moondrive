@@ -21,6 +21,7 @@ const state = {
 };
 
 let graph = null;
+let treemap = null;
 
 // ------------------------------------------------------------
 // Utilities
@@ -131,8 +132,15 @@ async function init() {
   state.settings = await md.settings.getAll();
   state.system = await md.system.info();
 
+  window.__fmtBytes = formatBytes; // used by the treemap renderer
+
   graph = new MoonGraph($('#graph-canvas'), {
     onSelect: onNodeSelect,
+    onEnter: onNodeEnter,
+  });
+
+  treemap = new MoonTreemap($('#treemap-canvas'), {
+    onSelect: (data) => (data ? showTmDetails(data) : clearTmDetails()),
     onEnter: onNodeEnter,
   });
 
@@ -276,8 +284,14 @@ function renderCurrentFolder() {
   const folder = currentFolder();
   if (!folder) return;
   graph.setFolder(folder);
+  if (treemap) {
+    treemap.setFolder(folder);
+    const hasChildren = (folder.children || []).some((c) => c.size > 0);
+    $('#treemap-empty').classList.toggle('hidden', hasChildren);
+  }
   renderBreadcrumbs();
   clearDetails();
+  clearTmDetails();
 }
 
 function renderBreadcrumbs() {
@@ -338,42 +352,66 @@ function onNodeEnter(data) {
 }
 
 // ------------------------------------------------------------
-// Details panel
+// Details panel (shared by the graph and treemap views)
 // ------------------------------------------------------------
 function clearDetails() {
   $('#details-empty').hidden = false;
   $('#details-content').hidden = true;
 }
+function clearTmDetails() {
+  $('#tm-details-empty').hidden = false;
+  $('#tm-details-content').hidden = true;
+}
+
+/** Fill the common icon/name/path/grid fields for a details panel. */
+function populateDetailsFields(prefix, data) {
+  const cat = data.category || (data.type === 'dir' ? 'folder' : 'other');
+  const color = window.CATEGORY_COLORS[cat] || '#6d7ba6';
+  const iconEl = $(`#${prefix}-icon`);
+  iconEl.textContent = window.CATEGORY_ICONS[cat] || '•';
+  iconEl.style.background = hexA(color, 0.14);
+  iconEl.style.color = color;
+  $(`#${prefix}-name`).textContent = data.name;
+  $(`#${prefix}-path`).textContent = data.path || '—';
+  $(`#${prefix}-size`).textContent = formatBytes(data.size);
+  $(`#${prefix}-type`).textContent = data.type === 'dir' ? 'Folder' : (data.ext ? `.${data.ext}` : 'File');
+  $(`#${prefix}-mtime`).textContent = formatDate(data.mtimeMs);
+  $(`#${prefix}-items`).textContent =
+    data.type === 'dir' ? formatNumber(data.childCount || (data.children ? data.children.length : 0)) : '—';
+}
 
 function showDetails(data) {
   $('#details-empty').hidden = true;
-  const content = $('#details-content');
-  content.hidden = false;
-
-  const cat = data.category || (data.type === 'dir' ? 'folder' : 'other');
-  const icon = window.CATEGORY_ICONS[cat] || '•';
-  const iconEl = $('#details-icon');
-  iconEl.textContent = icon;
-  iconEl.style.background = `${hexA(window.CATEGORY_COLORS[cat] || '#6d7ba6', 0.14)}`;
-  iconEl.style.color = window.CATEGORY_COLORS[cat] || '#6d7ba6';
-
-  $('#details-name').textContent = data.name;
-  $('#details-path').textContent = data.path || '—';
-  $('#details-size').textContent = formatBytes(data.size);
-  $('#details-type').textContent = data.type === 'dir' ? 'Folder' : (data.ext ? `.${data.ext}` : 'File');
-  $('#details-mtime').textContent = formatDate(data.mtimeMs);
-  $('#details-items').textContent = data.type === 'dir' ? formatNumber(data.childCount || (data.children ? data.children.length : 0)) : '—';
+  $('#details-content').hidden = false;
+  populateDetailsFields('details', data);
 
   const isReal = !!data.path && !data._group && !data._synthetic;
   $('#details-enter').hidden = !(data.type === 'dir');
   $('#details-open').hidden = !(isReal && data.type === 'file');
+  $('#details-rename').hidden = !isReal;
+  $('#details-move').hidden = !isReal;
   $('#details-reveal').hidden = !isReal;
   $('#details-trash').hidden = !isReal;
 
   $('#details-enter').onclick = () => onNodeEnter(data);
   $('#details-open').onclick = () => md.files.open(data.path);
+  $('#details-rename').onclick = () => renameNode(data);
+  $('#details-move').onclick = () => moveNode(data);
   $('#details-reveal').onclick = () => md.files.reveal(data.path);
   $('#details-trash').onclick = () => trashPath(data);
+}
+
+function showTmDetails(data) {
+  $('#tm-details-empty').hidden = true;
+  $('#tm-details-content').hidden = false;
+  populateDetailsFields('tm-details', data);
+  const isReal = !!data.path && !data._synthetic;
+  $('#tm-details-enter').hidden = !(data.type === 'dir');
+  $('#tm-details-reveal').hidden = !isReal;
+  $('#tm-details-trash').hidden = !isReal;
+  $('#tm-details-enter').onclick = () => onNodeEnter(data);
+  $('#tm-details-reveal').onclick = () => md.files.reveal(data.path);
+  $('#tm-details-trash').onclick = () => trashPath(data);
 }
 
 function hexA(hex, a) {
@@ -934,6 +972,224 @@ function cssEscape(s) {
 }
 
 // ------------------------------------------------------------
+// Rename & move
+// ------------------------------------------------------------
+function sepOf(p) {
+  return p.includes('\\') ? '\\' : '/';
+}
+function dirnameOf(p) {
+  const s = sepOf(p);
+  const idx = p.lastIndexOf(s);
+  return idx <= 0 ? p : p.slice(0, idx);
+}
+function joinPath(dir, name) {
+  const s = sepOf(dir);
+  return dir.endsWith(s) ? dir + name : dir + s + name;
+}
+
+/** Rewrite this node's path (and all descendants) after a rename/move. */
+function rewritePaths(node, oldPrefix, newPrefix) {
+  if (node.path && node.path.startsWith(oldPrefix)) {
+    node.path = newPrefix + node.path.slice(oldPrefix.length);
+  }
+  if (node.children) node.children.forEach((c) => rewritePaths(c, oldPrefix, newPrefix));
+}
+
+function findNodeByPath(root, target) {
+  if (root.path === target) return root;
+  if (root.children) {
+    for (const c of root.children) {
+      const found = findNodeByPath(c, target);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+async function renameNode(data) {
+  const newName = await promptModal({
+    title: 'Rename',
+    body: `Rename “${data.name}” to:`,
+    value: data.name,
+    confirmText: 'Rename',
+  });
+  if (!newName || newName === data.name) return;
+  if (/[\\/]/.test(newName)) { toast('Name cannot contain slashes', 'error'); return; }
+  const dir = dirnameOf(data.path);
+  const dest = joinPath(dir, newName);
+  try {
+    await md.files.move(data.path, dest);
+    const node = state.scan ? findNodeByPath(state.scan.root, data.path) : null;
+    if (node) {
+      node.name = newName;
+      rewritePaths(node, data.path, dest);
+    }
+    toast(`Renamed to “${newName}”`, 'success');
+    afterMutation();
+  } catch (e) {
+    toast(e.message || 'Rename failed', 'error', 5000);
+  }
+}
+
+async function moveNode(data) {
+  const res = await md.files.pickDestination();
+  if (res.canceled) return;
+  if (res.dir === dirnameOf(data.path)) { toast('Already in that folder', 'info'); return; }
+  if (res.dir === data.path || res.dir.startsWith(data.path + sepOf(data.path))) {
+    toast('Cannot move a folder into itself', 'error');
+    return;
+  }
+  const dest = joinPath(res.dir, data.name);
+  const ok = await confirmModal({
+    title: 'Move item',
+    body: `Move “${data.name}” to:\n${res.dir}\n\n(It must be inside a folder you've granted access to.)`,
+    confirmText: 'Move',
+    danger: false,
+  });
+  if (!ok) return;
+  try {
+    await md.files.move(data.path, dest);
+    removeFromTree(data.path);
+    toast(`Moved “${data.name}”. Rescan to see it in its new location.`, 'success', 4500);
+    afterMutation();
+  } catch (e) {
+    toast(e.message || 'Move failed', 'error', 5000);
+  }
+}
+
+function afterMutation() {
+  renderCurrentFolder();
+  renderLargest();
+  updateTopStats();
+}
+
+// ------------------------------------------------------------
+// Prompt modal
+// ------------------------------------------------------------
+function promptModal({ title, body, value = '', confirmText = 'Save' }) {
+  return new Promise((resolve) => {
+    const backdrop = $('#prompt-backdrop');
+    $('#prompt-title').textContent = title;
+    $('#prompt-body').textContent = body;
+    const input = $('#prompt-input');
+    input.value = value;
+    $('#prompt-confirm').textContent = confirmText;
+    backdrop.hidden = false;
+    setTimeout(() => { input.focus(); input.select(); }, 30);
+
+    const cleanup = (result) => {
+      backdrop.hidden = true;
+      $('#prompt-confirm').removeEventListener('click', onOk);
+      $('#prompt-cancel').removeEventListener('click', onCancel);
+      input.removeEventListener('keydown', onKey);
+      resolve(result);
+    };
+    const onOk = () => cleanup(input.value.trim());
+    const onCancel = () => cleanup(null);
+    const onKey = (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); onOk(); }
+      else if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+    };
+    $('#prompt-confirm').addEventListener('click', onOk);
+    $('#prompt-cancel').addEventListener('click', onCancel);
+    input.addEventListener('keydown', onKey);
+  });
+}
+
+// ------------------------------------------------------------
+// Scan history
+// ------------------------------------------------------------
+async function loadHistory() {
+  state.history = await md.history.list();
+  renderHistory();
+}
+
+function renderHistory() {
+  const entries = (state.history || []).slice().sort((a, b) => b.timestamp - a.timestamp);
+  const list = $('#history-list');
+  list.innerHTML = '';
+  $('#history-summary').textContent = entries.length
+    ? `${entries.length} scan${entries.length === 1 ? '' : 's'} recorded`
+    : 'No scans recorded yet. Scan a folder to start tracking its size over time.';
+
+  entries.forEach((entry) => {
+    // chronological series for this path, to draw a trend + delta
+    const series = entries
+      .filter((e) => e.path === entry.path)
+      .sort((a, b) => a.timestamp - b.timestamp);
+    const idx = series.findIndex((e) => e.timestamp === entry.timestamp);
+    const prev = idx > 0 ? series[idx - 1] : null;
+    const delta = prev ? entry.totalSize - prev.totalSize : 0;
+
+    const card = document.createElement('div');
+    card.className = 'history-card';
+
+    const deltaClass = !prev ? 'same' : delta > 0 ? 'up' : delta < 0 ? 'down' : 'same';
+    const deltaText = !prev
+      ? 'first scan'
+      : delta === 0
+      ? 'no change'
+      : `${delta > 0 ? '▲' : '▼'} ${formatBytes(Math.abs(delta))}`;
+
+    card.innerHTML = `
+      <div class="history-spark">${sparklineSVG(series.map((s) => s.totalSize))}</div>
+      <div class="history-main">
+        <div class="history-path" title="${escapeHtml(entry.path)}">${escapeHtml(basename(entry.path) || entry.path)}</div>
+        <div class="history-sub">${escapeHtml(entry.path)}</div>
+        <div class="history-sub">${new Date(entry.timestamp).toLocaleString()} · ${formatNumber(entry.files)} files · ${formatNumber(entry.dirs)} folders</div>
+      </div>
+      <div class="history-size">
+        <div class="hs-big">${formatBytes(entry.totalSize)}</div>
+        <div class="history-delta ${deltaClass}">${deltaText}</div>
+      </div>
+      <div class="history-actions">
+        <button class="ghost-btn hist-rescan">Rescan</button>
+      </div>`;
+    card.querySelector('.hist-rescan').addEventListener('click', () => {
+      switchView('graph');
+      startScan(entry.path);
+    });
+    list.appendChild(card);
+  });
+}
+
+/** Tiny inline SVG sparkline of totalSize over time. */
+function sparklineSVG(values) {
+  const w = 92;
+  const h = 34;
+  if (!values.length) return '';
+  if (values.length === 1) {
+    return `<svg width="${w}" height="${h}"><circle cx="${w / 2}" cy="${h / 2}" r="3.5" fill="#57a5ff"/></svg>`;
+  }
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const pts = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * (w - 6) + 3;
+    const y = h - 4 - ((v - min) / range) * (h - 8);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const last = pts[pts.length - 1].split(',');
+  return `<svg width="${w}" height="${h}">
+    <polyline fill="none" stroke="#3d7bff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" points="${pts.join(' ')}"/>
+    <circle cx="${last[0]}" cy="${last[1]}" r="2.6" fill="#57a5ff"/>
+  </svg>`;
+}
+
+async function clearHistory() {
+  const ok = await confirmModal({
+    title: 'Clear scan history?',
+    body: 'This removes all recorded scan history. It does not touch any files.',
+    confirmText: 'Clear',
+  });
+  if (!ok) return;
+  await md.history.clear();
+  state.history = [];
+  renderHistory();
+  toast('Scan history cleared', 'info');
+}
+
+// ------------------------------------------------------------
 // View switching
 // ------------------------------------------------------------
 function switchView(view) {
@@ -943,6 +1199,18 @@ function switchView(view) {
   if (view === 'duplicates' && !state.duplicates) $('#dupes-summary').textContent = 'Click “Find duplicates” to scan for repeated files.';
   if (view === 'updates' && !state.updates) checkUpdates();
   if (view === 'startup' && !state.startup) refreshStartup();
+  if (view === 'history') loadHistory();
+  if (view === 'treemap' && treemap) {
+    // The canvas has no size while hidden — measure and lay out now it's visible.
+    requestAnimationFrame(() => {
+      treemap._resize();
+      if (currentFolder()) {
+        treemap.setFolder(currentFolder());
+        const hasChildren = (currentFolder().children || []).some((c) => c.size > 0);
+        $('#treemap-empty').classList.toggle('hidden', hasChildren);
+      }
+    });
+  }
 }
 
 // ------------------------------------------------------------
@@ -982,6 +1250,12 @@ function bindUI() {
 
   // startup apps
   $('#refresh-startup').addEventListener('click', refreshStartup);
+
+  // treemap
+  $('#treemap-up').addEventListener('click', () => onNodeEnter({ _up: true }));
+
+  // history
+  $('#history-clear').addEventListener('click', clearHistory);
 
   // chat
   $('#chat-form').addEventListener('submit', (e) => {

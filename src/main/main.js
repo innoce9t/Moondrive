@@ -151,6 +151,15 @@ function registerIpc() {
       const result = await session.run();
       lastScan = result;
       activeScan = null;
+      // Persist a compact history record for trend tracking.
+      store.addScanHistory({
+        path: folderPath,
+        timestamp: Date.now(),
+        files: result.stats.files,
+        dirs: result.stats.dirs,
+        totalSize: result.stats.totalSize,
+        byCategory: result.stats.byCategory,
+      });
       return { ok: true, ...serializeScan(result) };
     } catch (err) {
       activeScan = null;
@@ -268,6 +277,20 @@ function registerIpc() {
   // --- Startup apps -------------------------------------------------------
   ipcMain.handle('startup:list', () => systemTools.listStartupApps());
   ipcMain.handle('startup:set', (_e, { entry, enable }) => systemTools.setStartupApp(entry, enable));
+
+  // --- Scan history -------------------------------------------------------
+  ipcMain.handle('history:list', () => store.getScanHistory());
+  ipcMain.handle('history:clear', () => store.clearScanHistory());
+
+  // --- Move destination picker -------------------------------------------
+  ipcMain.handle('fs:pickDestination', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose a destination folder',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (result.canceled || !result.filePaths.length) return { canceled: true };
+    return { canceled: false, dir: result.filePaths[0] };
+  });
 }
 
 // ---------------------------------------------------------------------------

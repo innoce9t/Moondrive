@@ -16,6 +16,7 @@ class Store {
       geminiApiKey: '',
       geminiModel: 'gemini-2.0-flash',
       followSymlinks: false,
+      scanHistory: [], // [{ path, timestamp, files, dirs, totalSize, byCategory }]
     };
     this._load();
   }
@@ -70,6 +71,27 @@ class Store {
     this.data.allowedFolders = this.data.allowedFolders.filter((f) => f !== norm);
     this._save();
     return this.data.allowedFolders;
+  }
+
+  /** Record a completed scan. Keeps the most recent 50 entries. */
+  addScanHistory(record) {
+    this.data.scanHistory = this.data.scanHistory || [];
+    this.data.scanHistory.unshift(record);
+    if (this.data.scanHistory.length > 50) {
+      this.data.scanHistory = this.data.scanHistory.slice(0, 50);
+    }
+    this._save();
+    return this.data.scanHistory;
+  }
+
+  getScanHistory() {
+    return this.data.scanHistory || [];
+  }
+
+  clearScanHistory() {
+    this.data.scanHistory = [];
+    this._save();
+    return [];
   }
 
   /**
