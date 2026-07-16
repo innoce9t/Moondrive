@@ -1,0 +1,777 @@
+'use strict';
+
+/* ============================================================
+   Moondrive renderer — app logic
+   ============================================================ */
+
+const md = window.moondrive; // preload bridge
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+const state = {
+  settings: null,
+  system: null,
+  scan: null, // { root, stats }
+  navStack: [], // nodes from root -> current
+  selectedNode: null,
+  chatHistory: [], // {role, content}
+  duplicates: null,
+};
+
+let graph = null;
+
+// ------------------------------------------------------------
+// Utilities
+// ------------------------------------------------------------
+function formatBytes(n) {
+  if (n === 0 || n == null) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatNumber(n) {
+  return (n || 0).toLocaleString();
+}
+
+function formatDate(ms) {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function basename(p) {
+  const parts = p.split(/[\\/]/);
+  return parts[parts.length - 1] || p;
+}
+
+function toast(message, type = 'info', timeout = 3200) {
+  const host = $('#toast-host');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  const icons = { success: '✓', error: '✕', info: 'ⓘ' };
+  el.innerHTML = `<span class="toast-ico">${icons[type] || 'ⓘ'}</span><span></span>`;
+  el.querySelector('span:last-child').textContent = message;
+  host.appendChild(el);
+  setTimeout(() => {
+    el.classList.add('leaving');
+    setTimeout(() => el.remove(), 300);
+  }, timeout);
+}
+
+function confirmModal({ title, body, confirmText = 'Confirm', danger = true }) {
+  return new Promise((resolve) => {
+    const backdrop = $('#modal-backdrop');
+    $('#modal-title').textContent = title;
+    $('#modal-body').textContent = body;
+    const confirmBtn = $('#modal-confirm');
+    confirmBtn.textContent = confirmText;
+    confirmBtn.className = danger ? 'danger-btn' : 'primary-btn';
+    backdrop.hidden = false;
+
+    const cleanup = (result) => {
+      backdrop.hidden = true;
+      confirmBtn.removeEventListener('click', onConfirm);
+      $('#modal-cancel').removeEventListener('click', onCancel);
+      resolve(result);
+    };
+    const onConfirm = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    confirmBtn.addEventListener('click', onConfirm);
+    $('#modal-cancel').addEventListener('click', onCancel);
+  });
+}
+
+// Very small, safe markdown -> HTML (no raw HTML passthrough).
+function renderMarkdown(text) {
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const lines = text.split('\n');
+  let html = '';
+  let inList = false;
+  let listType = 'ul';
+  const inline = (s) =>
+    esc(s)
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/(?<!\*)\*(?!\*)([^*]+)\*(?!\*)/g, '<em>$1</em>');
+
+  const closeList = () => { if (inList) { html += `</${listType}>`; inList = false; } };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (/^#{1,6}\s/.test(line)) {
+      closeList();
+      const level = Math.min(3, line.match(/^#+/)[0].length);
+      html += `<h${level}>${inline(line.replace(/^#+\s/, ''))}</h${level}>`;
+    } else if (/^\s*[-*]\s+/.test(line)) {
+      if (!inList || listType !== 'ul') { closeList(); html += '<ul>'; inList = true; listType = 'ul'; }
+      html += `<li>${inline(line.replace(/^\s*[-*]\s+/, ''))}</li>`;
+    } else if (/^\s*\d+\.\s+/.test(line)) {
+      if (!inList || listType !== 'ol') { closeList(); html += '<ol>'; inList = true; listType = 'ol'; }
+      html += `<li>${inline(line.replace(/^\s*\d+\.\s+/, ''))}</li>`;
+    } else if (line.trim() === '') {
+      closeList();
+    } else {
+      closeList();
+      html += `<p>${inline(line)}</p>`;
+    }
+  }
+  closeList();
+  return html;
+}
+
+// ------------------------------------------------------------
+// Init
+// ------------------------------------------------------------
+async function init() {
+  state.settings = await md.settings.getAll();
+  state.system = await md.system.info();
+
+  graph = new MoonGraph($('#graph-canvas'), {
+    onSelect: onNodeSelect,
+    onEnter: onNodeEnter,
+  });
+
+  buildLegend();
+  renderFolderLists();
+  bindUI();
+  bindScanProgress();
+  hydrateSettings();
+}
+
+function buildLegend() {
+  const legend = $('#legend');
+  const cats = ['folder', 'image', 'video', 'audio', 'document', 'archive', 'code', 'other'];
+  legend.innerHTML = cats
+    .map(
+      (c) =>
+        `<div class="legend-item"><span class="legend-dot" style="background:${window.CATEGORY_COLORS[c]};color:${window.CATEGORY_COLORS[c]}"></span>${c}</div>`
+    )
+    .join('');
+}
+
+// ------------------------------------------------------------
+// Sandbox folders
+// ------------------------------------------------------------
+async function renderFolderLists() {
+  const folders = await md.sandbox.list();
+  const makeChip = (f, withScan) => {
+    const div = document.createElement('div');
+    div.className = 'folder-chip';
+    div.innerHTML = `
+      <span class="fc-name" title="${f}">${basename(f) || f}</span>
+      ${withScan ? '<button class="fc-scan" title="Scan this folder">◎</button>' : ''}
+      <button class="fc-remove" title="Remove access">✕</button>`;
+    if (withScan) div.querySelector('.fc-scan').addEventListener('click', () => startScan(f));
+    div.querySelector('.fc-remove').addEventListener('click', async () => {
+      await md.sandbox.removeFolder(f);
+      renderFolderLists();
+      toast('Folder access removed', 'info');
+    });
+    return div;
+  };
+
+  const side = $('#folder-list');
+  side.innerHTML = '';
+  const setSide = $('#settings-folder-list');
+  setSide.innerHTML = '';
+
+  if (!folders.length) {
+    side.innerHTML = '<p style="font-size:11.5px;color:var(--text-faint);padding:4px">No folders granted yet.</p>';
+  }
+  folders.forEach((f) => {
+    side.appendChild(makeChip(f, true));
+    setSide.appendChild(makeChip(f, false));
+  });
+}
+
+async function pickFolder() {
+  const res = await md.sandbox.pickFolder();
+  if (res.canceled) return;
+  renderFolderLists();
+  toast(`Granted access to ${basename(res.folder)}`, 'success');
+  const doScan = await confirmModal({
+    title: 'Scan now?',
+    body: `Scan ${res.folder} to build its node graph?`,
+    confirmText: 'Scan',
+    danger: false,
+  });
+  if (doScan) startScan(res.folder);
+}
+
+async function grantRoot() {
+  const res = await md.sandbox.addRoot();
+  if (res.canceled) return;
+  renderFolderLists();
+  toast('Root access granted — scan with care', 'info', 4200);
+}
+
+// ------------------------------------------------------------
+// Scanning
+// ------------------------------------------------------------
+function bindScanProgress() {
+  md.scan.onProgress((p) => {
+    $('#scan-files').textContent = formatNumber(p.files);
+    $('#scan-dirs').textContent = formatNumber(p.dirs);
+    $('#scan-size').textContent = formatBytes(p.totalSize);
+  });
+}
+
+async function startScan(folderPath) {
+  switchView('graph');
+  $('#empty-state').classList.add('hidden');
+  const overlay = $('#scan-overlay');
+  overlay.hidden = false;
+  $('#scan-title').textContent = 'Scanning…';
+  $('#scan-path').textContent = folderPath;
+  $('#scan-files').textContent = '0';
+  $('#scan-dirs').textContent = '0';
+  $('#scan-size').textContent = '0 B';
+
+  const result = await md.scan.start(folderPath);
+  overlay.hidden = true;
+
+  if (!result.ok) {
+    toast(result.error || 'Scan failed', 'error', 5000);
+    if (!state.scan) $('#empty-state').classList.remove('hidden');
+    return;
+  }
+
+  state.scan = { root: result.root, stats: result.stats };
+  state.navStack = [result.root];
+  state.duplicates = null;
+  $('#rescan-btn').disabled = false;
+
+  updateTopStats();
+  renderCurrentFolder();
+  renderLargest();
+
+  const skipped = result.stats.errors ? ` · ${formatNumber(result.stats.errors)} items skipped` : '';
+  toast(
+    `Scanned ${formatNumber(result.stats.files)} files · ${formatBytes(result.stats.totalSize)}${skipped}`,
+    'success',
+    4200
+  );
+}
+
+function updateTopStats() {
+  if (!state.scan) return;
+  $('#stat-total-value').textContent = formatBytes(state.scan.stats.totalSize);
+  $('#stat-files-value').textContent = formatNumber(state.scan.stats.files);
+}
+
+// ------------------------------------------------------------
+// Graph navigation
+// ------------------------------------------------------------
+function currentFolder() {
+  return state.navStack[state.navStack.length - 1];
+}
+
+function renderCurrentFolder() {
+  const folder = currentFolder();
+  if (!folder) return;
+  graph.setFolder(folder);
+  renderBreadcrumbs();
+  clearDetails();
+}
+
+function renderBreadcrumbs() {
+  const bc = $('#breadcrumbs');
+  bc.innerHTML = '';
+  state.navStack.forEach((node, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'crumb-sep';
+      sep.textContent = '›';
+      bc.appendChild(sep);
+    }
+    const crumb = document.createElement('button');
+    crumb.className = 'crumb' + (i === state.navStack.length - 1 ? ' current' : '');
+    crumb.textContent = i === 0 ? basename(node.path) || node.path : node.name;
+    crumb.title = node.path || node.name;
+    crumb.addEventListener('click', () => {
+      state.navStack = state.navStack.slice(0, i + 1);
+      renderCurrentFolder();
+    });
+    bc.appendChild(crumb);
+  });
+}
+
+function onNodeSelect(data) {
+  state.selectedNode = data;
+  if (!data) { clearDetails(); return; }
+  showDetails(data);
+}
+
+function onNodeEnter(data) {
+  if (!data) return;
+  if (data._up) {
+    if (state.navStack.length > 1) {
+      state.navStack.pop();
+      renderCurrentFolder();
+    }
+    return;
+  }
+  if (data._group) {
+    // Expand the overflow bundle into a synthetic folder.
+    const synth = {
+      name: data.name,
+      path: currentFolder().path,
+      type: 'dir',
+      size: data.size,
+      children: data._group,
+      _synthetic: true,
+    };
+    state.navStack.push(synth);
+    renderCurrentFolder();
+    return;
+  }
+  if (data.type === 'dir') {
+    state.navStack.push(data);
+    renderCurrentFolder();
+  }
+}
+
+// ------------------------------------------------------------
+// Details panel
+// ------------------------------------------------------------
+function clearDetails() {
+  $('#details-empty').hidden = false;
+  $('#details-content').hidden = true;
+}
+
+function showDetails(data) {
+  $('#details-empty').hidden = true;
+  const content = $('#details-content');
+  content.hidden = false;
+
+  const cat = data.category || (data.type === 'dir' ? 'folder' : 'other');
+  const icon = window.CATEGORY_ICONS[cat] || '•';
+  const iconEl = $('#details-icon');
+  iconEl.textContent = icon;
+  iconEl.style.background = `${hexA(window.CATEGORY_COLORS[cat] || '#6d7ba6', 0.14)}`;
+  iconEl.style.color = window.CATEGORY_COLORS[cat] || '#6d7ba6';
+
+  $('#details-name').textContent = data.name;
+  $('#details-path').textContent = data.path || '—';
+  $('#details-size').textContent = formatBytes(data.size);
+  $('#details-type').textContent = data.type === 'dir' ? 'Folder' : (data.ext ? `.${data.ext}` : 'File');
+  $('#details-mtime').textContent = formatDate(data.mtimeMs);
+  $('#details-items').textContent = data.type === 'dir' ? formatNumber(data.childCount || (data.children ? data.children.length : 0)) : '—';
+
+  const isReal = !!data.path && !data._group && !data._synthetic;
+  $('#details-enter').hidden = !(data.type === 'dir');
+  $('#details-open').hidden = !(isReal && data.type === 'file');
+  $('#details-reveal').hidden = !isReal;
+  $('#details-trash').hidden = !isReal;
+
+  $('#details-enter').onclick = () => onNodeEnter(data);
+  $('#details-open').onclick = () => md.files.open(data.path);
+  $('#details-reveal').onclick = () => md.files.reveal(data.path);
+  $('#details-trash').onclick = () => trashPath(data);
+}
+
+function hexA(hex, a) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+async function trashPath(data) {
+  const ok = await confirmModal({
+    title: 'Move to Trash?',
+    body: `“${data.name}” (${formatBytes(data.size)}) will be moved to your system Trash. You can restore it from there.`,
+    confirmText: 'Move to Trash',
+  });
+  if (!ok) return;
+  try {
+    await md.files.trash(data.path);
+    toast(`Moved “${data.name}” to Trash`, 'success');
+    removeFromTree(data.path);
+    renderCurrentFolder();
+    renderLargest();
+    updateTopStats();
+  } catch (e) {
+    toast(e.message || 'Could not move to Trash', 'error', 5000);
+  }
+}
+
+/** Remove a path from the in-memory tree and re-aggregate sizes along the way. */
+function removeFromTree(targetPath) {
+  if (!state.scan) return;
+  const stack = state.navStack.slice();
+  (function recurse(node) {
+    if (!node.children) return false;
+    const idx = node.children.findIndex((c) => c.path === targetPath);
+    if (idx !== -1) {
+      const removed = node.children[idx];
+      node.children.splice(idx, 1);
+      // propagate size reduction up the nav stack
+      for (const anc of stack) {
+        if (anc !== node && isAncestorPath(anc.path, targetPath)) anc.size -= removed.size;
+      }
+      node.size -= removed.size;
+      state.scan.stats.totalSize -= removed.size;
+      if (removed.type === 'file') state.scan.stats.files -= 1;
+      return true;
+    }
+    for (const c of node.children) if (c.type === 'dir' && recurse(c)) return true;
+    return false;
+  })(state.scan.root);
+}
+
+function isAncestorPath(anc, child) {
+  if (!anc || !child) return false;
+  return child === anc || child.startsWith(anc.endsWith('/') || anc.endsWith('\\') ? anc : anc + '/') || child.startsWith(anc + '\\');
+}
+
+// ------------------------------------------------------------
+// Largest files view
+// ------------------------------------------------------------
+function renderLargest() {
+  const tbody = $('#largest-table').querySelector('tbody');
+  tbody.innerHTML = '';
+  if (!state.scan) {
+    tbody.innerHTML = '<tr><td class="empty-list">Run a scan to see your largest files.</td></tr>';
+    return;
+  }
+  const files = state.scan.stats.largest || [];
+  if (!files.length) {
+    tbody.innerHTML = '<tr><td class="empty-list">No files found.</td></tr>';
+    return;
+  }
+  const max = files[0].size || 1;
+  files.forEach((f) => {
+    const cat = catFromPath(f.path);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="cell-check"><input type="checkbox" data-path="${encodeURIComponent(f.path)}"></td>
+      <td>
+        <div class="file-name-cell">
+          <span class="file-dot" style="background:${window.CATEGORY_COLORS[cat]};color:${window.CATEGORY_COLORS[cat]}"></span>
+          <div style="min-width:0">
+            <div class="file-name">${basename(f.path)}</div>
+            <div class="file-path-sub" title="${f.path}">${f.path}</div>
+          </div>
+        </div>
+      </td>
+      <td class="cell-bar"><div class="size-bar"><div class="size-bar-fill" style="width:${(f.size / max) * 100}%"></div></div></td>
+      <td><span class="size-text">${formatBytes(f.size)}</span></td>
+      <td class="cell-actions">
+        <button class="row-btn reveal" title="Reveal">◎</button>
+        <button class="row-btn trash" title="Move to Trash">🗑</button>
+      </td>`;
+    tr.querySelector('.reveal').addEventListener('click', () => md.files.reveal(f.path));
+    tr.querySelector('.trash').addEventListener('click', () =>
+      trashPath({ name: basename(f.path), path: f.path, size: f.size, type: 'file' })
+    );
+    tr.querySelector('input').addEventListener('change', updateLargestSelection);
+    tbody.appendChild(tr);
+  });
+  updateLargestSelection();
+}
+
+function updateLargestSelection() {
+  const checked = $$('#largest-table input:checked');
+  $('#largest-trash-selected').disabled = checked.length === 0;
+  $('#largest-trash-selected').textContent = checked.length ? `Trash ${checked.length} selected` : 'Trash selected';
+}
+
+async function trashSelectedLargest() {
+  const checked = $$('#largest-table input:checked');
+  const paths = checked.map((c) => decodeURIComponent(c.dataset.path));
+  if (!paths.length) return;
+  const ok = await confirmModal({
+    title: `Move ${paths.length} files to Trash?`,
+    body: `${paths.length} selected files will be moved to your system Trash.`,
+    confirmText: 'Move to Trash',
+  });
+  if (!ok) return;
+  const results = await md.files.trashMany(paths);
+  const okCount = results.filter((r) => r.ok).length;
+  results.filter((r) => r.ok).forEach((r) => removeFromTree(r.path));
+  renderCurrentFolder();
+  renderLargest();
+  updateTopStats();
+  toast(`Moved ${okCount}/${paths.length} files to Trash`, okCount ? 'success' : 'error');
+}
+
+function catFromPath(p) {
+  const ext = (p.split('.').pop() || '').toLowerCase();
+  const map = window.__extCat || (window.__extCat = buildExtCat());
+  return map[ext] || 'other';
+}
+function buildExtCat() {
+  // mirror of scanner category map for renderer-side coloring
+  const groups = {
+    image: ['jpg','jpeg','png','gif','bmp','tiff','tif','webp','svg','heic','raw','cr2','nef','ico'],
+    video: ['mp4','mkv','mov','avi','wmv','flv','webm','m4v','mpg','mpeg','3gp'],
+    audio: ['mp3','wav','flac','aac','ogg','m4a','wma','aiff','opus'],
+    document: ['pdf','doc','docx','txt','rtf','odt','xls','xlsx','ppt','pptx','csv','md','pages','key','numbers','epub'],
+    archive: ['zip','rar','7z','tar','gz','bz2','xz','iso','dmg','pkg','deb','rpm'],
+    code: ['js','ts','jsx','tsx','py','java','c','cpp','h','hpp','cs','go','rs','rb','php','html','css','json','xml','yml','yaml','sh','sql','swift','kt'],
+    executable: ['exe','msi','app','bin','apk','jar','bat','cmd','com'],
+  };
+  const map = {};
+  for (const [k, arr] of Object.entries(groups)) for (const e of arr) map[e] = k;
+  return map;
+}
+
+// ------------------------------------------------------------
+// Duplicates view
+// ------------------------------------------------------------
+async function findDuplicates() {
+  if (!state.scan) { toast('Run a scan first', 'info'); return; }
+  const btn = $('#find-dupes');
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  $('#dupes-summary').textContent = 'Comparing files by size and content fingerprint…';
+  try {
+    const groups = await md.scan.duplicates();
+    state.duplicates = groups;
+    renderDuplicates();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Find duplicates';
+  }
+}
+
+function renderDuplicates() {
+  const list = $('#dupes-list');
+  const groups = state.duplicates || [];
+  const wasted = groups.reduce((s, g) => s + g.wasted, 0);
+  $('#dupes-summary').textContent = groups.length
+    ? `${groups.length} duplicate groups · about ${formatBytes(wasted)} reclaimable`
+    : 'No duplicates found. 🎉';
+  list.innerHTML = '';
+  groups.forEach((g) => {
+    const div = document.createElement('div');
+    div.className = 'dupe-group';
+    const head = document.createElement('div');
+    head.className = 'dupe-group-head';
+    head.innerHTML = `<span class="dupe-badge">${g.count} copies</span> <strong>${formatBytes(g.size)}</strong> each · <span style="color:var(--warn)">${formatBytes(g.wasted)} wasted</span>`;
+    div.appendChild(head);
+    g.files.forEach((f, idx) => {
+      const row = document.createElement('div');
+      row.className = 'dupe-file';
+      // keep the first copy unchecked by default (the "original")
+      row.innerHTML = `
+        <input type="checkbox" data-path="${encodeURIComponent(f.path)}" ${idx === 0 ? '' : ''}>
+        <span class="dupe-path" title="${f.path}">${f.path}</span>
+        <button class="row-btn reveal" title="Reveal">◎</button>`;
+      row.querySelector('.reveal').addEventListener('click', () => md.files.reveal(f.path));
+      row.querySelector('input').addEventListener('change', updateDupeSelection);
+      div.appendChild(row);
+    });
+    list.appendChild(div);
+  });
+  updateDupeSelection();
+}
+
+function updateDupeSelection() {
+  const checked = $$('#dupes-list input:checked');
+  $('#dupes-trash-selected').disabled = checked.length === 0;
+  $('#dupes-trash-selected').textContent = checked.length ? `Trash ${checked.length} selected` : 'Trash selected';
+}
+
+async function trashSelectedDupes() {
+  const checked = $$('#dupes-list input:checked');
+  const paths = checked.map((c) => decodeURIComponent(c.dataset.path));
+  if (!paths.length) return;
+  const ok = await confirmModal({
+    title: `Move ${paths.length} duplicates to Trash?`,
+    body: `${paths.length} selected copies will be moved to your system Trash. Make sure you keep at least one copy of each file.`,
+    confirmText: 'Move to Trash',
+  });
+  if (!ok) return;
+  const results = await md.files.trashMany(paths);
+  const okCount = results.filter((r) => r.ok).length;
+  results.filter((r) => r.ok).forEach((r) => removeFromTree(r.path));
+  // prune from duplicate groups
+  state.duplicates = (state.duplicates || [])
+    .map((g) => ({ ...g, files: g.files.filter((f) => !paths.includes(f.path)) }))
+    .filter((g) => g.files.length > 1);
+  renderDuplicates();
+  renderCurrentFolder();
+  renderLargest();
+  updateTopStats();
+  toast(`Moved ${okCount}/${paths.length} duplicates to Trash`, okCount ? 'success' : 'error');
+}
+
+// ------------------------------------------------------------
+// AI assistant
+// ------------------------------------------------------------
+async function sendChat(text) {
+  if (!text.trim()) return;
+  if (!state.settings.geminiApiKey) {
+    toast('Add your Gemini API key in Settings first', 'error', 4500);
+    switchView('settings');
+    return;
+  }
+  const intro = $('.chat-intro');
+  if (intro) intro.remove();
+
+  appendMessage('user', text);
+  state.chatHistory.push({ role: 'user', content: text });
+  $('#chat-text').value = '';
+  autoGrow($('#chat-text'));
+
+  const typing = appendTyping();
+  $('#chat-send').disabled = true;
+
+  const res = await md.ai.ask(state.chatHistory.slice(-12));
+  typing.remove();
+  $('#chat-send').disabled = false;
+
+  if (!res.ok) {
+    appendMessage('assistant', `⚠️ ${res.error}`);
+    return;
+  }
+  appendMessage('assistant', res.text);
+  state.chatHistory.push({ role: 'assistant', content: res.text });
+}
+
+function appendMessage(role, content) {
+  const log = $('#chat-log');
+  const msg = document.createElement('div');
+  msg.className = `msg ${role}`;
+  const avatar = role === 'assistant' ? '✦' : '🙂';
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  if (role === 'assistant') bubble.innerHTML = renderMarkdown(content);
+  else bubble.textContent = content;
+  msg.innerHTML = `<div class="msg-avatar">${avatar}</div>`;
+  msg.appendChild(bubble);
+  log.appendChild(msg);
+  log.scrollTop = log.scrollHeight;
+}
+
+function appendTyping() {
+  const log = $('#chat-log');
+  const msg = document.createElement('div');
+  msg.className = 'msg assistant typing';
+  msg.innerHTML = `<div class="msg-avatar">✦</div><div class="msg-bubble"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`;
+  log.appendChild(msg);
+  log.scrollTop = log.scrollHeight;
+  return msg;
+}
+
+function autoGrow(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(160, el.scrollHeight) + 'px';
+}
+
+// ------------------------------------------------------------
+// Settings
+// ------------------------------------------------------------
+function hydrateSettings() {
+  $('#gemini-key').value = state.settings.geminiApiKey || '';
+  $('#gemini-model').value = state.settings.geminiModel || 'gemini-2.0-flash';
+  $('#follow-symlinks').checked = !!state.settings.followSymlinks;
+}
+
+async function saveAiSettings() {
+  await md.settings.set('geminiApiKey', $('#gemini-key').value.trim());
+  state.settings = await md.settings.set('geminiModel', $('#gemini-model').value);
+  const flash = $('#ai-saved');
+  flash.hidden = false;
+  setTimeout(() => (flash.hidden = true), 2000);
+  toast('AI settings saved', 'success');
+}
+
+// ------------------------------------------------------------
+// View switching
+// ------------------------------------------------------------
+function switchView(view) {
+  $$('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
+  $$('.view').forEach((v) => v.classList.toggle('active', v.dataset.view === view));
+  if (view === 'largest') renderLargest();
+  if (view === 'duplicates' && !state.duplicates) $('#dupes-summary').textContent = 'Click “Find duplicates” to scan for repeated files.';
+}
+
+// ------------------------------------------------------------
+// Bind UI
+// ------------------------------------------------------------
+function bindUI() {
+  $$('.nav-item').forEach((b) => b.addEventListener('click', () => switchView(b.dataset.view)));
+
+  $('#add-folder-btn').addEventListener('click', pickFolder);
+  $('#add-root-btn').addEventListener('click', grantRoot);
+  $('#settings-add-folder').addEventListener('click', pickFolder);
+  $('#settings-add-root').addEventListener('click', grantRoot);
+  $('#empty-add-folder').addEventListener('click', pickFolder);
+  $('#empty-suggest').addEventListener('click', suggestAndScan);
+
+  $('#rescan-btn').addEventListener('click', () => {
+    if (state.scan) startScan(state.scan.root.path);
+  });
+
+  $('#scan-cancel').addEventListener('click', () => md.scan.cancel());
+
+  // graph controls
+  $('#zoom-in').addEventListener('click', () => graph.zoomIn());
+  $('#zoom-out').addEventListener('click', () => graph.zoomOut());
+  $('#zoom-reset').addEventListener('click', () => graph.resetView());
+  $('#graph-up').addEventListener('click', () => onNodeEnter({ _up: true }));
+
+  // largest / dupes
+  $('#largest-trash-selected').addEventListener('click', trashSelectedLargest);
+  $('#find-dupes').addEventListener('click', findDuplicates);
+  $('#dupes-trash-selected').addEventListener('click', trashSelectedDupes);
+
+  // chat
+  $('#chat-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    sendChat($('#chat-text').value);
+  });
+  $('#chat-text').addEventListener('input', (e) => autoGrow(e.target));
+  $('#chat-text').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChat($('#chat-text').value);
+    }
+  });
+  $$('.chat-suggestions button').forEach((b) =>
+    b.addEventListener('click', () => sendChat(b.dataset.prompt))
+  );
+
+  // settings
+  $('#save-ai').addEventListener('click', saveAiSettings);
+  $('#toggle-key').addEventListener('click', () => {
+    const inp = $('#gemini-key');
+    inp.type = inp.type === 'password' ? 'text' : 'password';
+  });
+  $('#follow-symlinks').addEventListener('change', async (e) => {
+    state.settings = await md.settings.set('followSymlinks', e.target.checked);
+    toast('Symlink preference saved', 'info');
+  });
+
+  // keyboard: Escape closes modal / clears selection
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('#modal-backdrop').hidden) $('#modal-cancel').click();
+  });
+}
+
+async function suggestAndScan() {
+  const suggestions = await md.sandbox.suggestFolders();
+  if (!suggestions.length) {
+    toast('No suggested folders available — grant one manually', 'info');
+    return;
+  }
+  // Prefer Downloads (usually the most cluttered), else the first suggestion.
+  const preferred = suggestions.find((s) => /downloads/i.test(s)) || suggestions[0];
+  try {
+    const res = await md.sandbox.grantSuggested(preferred);
+    renderFolderLists();
+    toast(`Scanning ${basename(res.folder)}…`, 'info');
+    startScan(res.folder);
+  } catch (e) {
+    toast(e.message || 'Could not grant folder', 'error');
+  }
+}
+
+// ------------------------------------------------------------
+document.addEventListener('DOMContentLoaded', init);

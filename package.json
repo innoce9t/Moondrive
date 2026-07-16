@@ -1,0 +1,34 @@
+{
+  "name": "moondrive",
+  "version": "1.0.0",
+  "description": "Moondrive — a sandboxed drive organizer that scans your disks, visualises files as a navigable node graph, and uses Gemini AI to help you clean up and organise your data.",
+  "main": "src/main/main.js",
+  "author": "Moondrive",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.moondrive.app",
+    "productName": "Moondrive",
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "mac": { "category": "public.app-category.utilities" },
+    "win": { "target": "nsis" },
+    "linux": { "target": "AppImage", "category": "Utility" }
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {}
+}
