@@ -27,6 +27,13 @@ removal goes to your system Trash, never a hard delete).
 - **🤖 Gemini AI assistant** — chat with Google's Gemini about how to organise
   your drive. It sees only *aggregate* stats and the *names* of your largest
   items — **never file contents**.
+- **⭳ App updates (Windows / winget)** — check for available package upgrades
+  via `winget`, pick exactly which apps to update, and upgrade them silently
+  with live console output. Or upgrade everything in one click.
+- **⏻ Startup-app manager (Windows)** — see everything that launches at boot
+  (registry Run keys + startup folders, per-user and machine-wide) and flip each
+  on/off with a toggle. Uses the same non-destructive StartupApproved mechanism
+  as Task Manager — it never deletes your Run entries or shortcuts.
 - **🛡 Sandboxed by design** — Moondrive can only read or modify folders you
   explicitly grant. There's an optional, clearly-warned "grant root access" for
   power users. Every filesystem mutation passes through a single allow-list gate
@@ -44,6 +51,7 @@ src/
 │   ├── main.js           App lifecycle + all IPC handlers (sandbox-gated)
 │   ├── scanner.js        Recursive, cancellable scan + duplicate detection
 │   ├── gemini.js         Minimal Gemini REST client + privacy-safe summariser
+│   ├── system-tools.js   winget upgrades + Windows startup-app management
 │   └── store.js          Local JSON settings + the sandbox allow-list gate
 ├── preload/
 │   └── preload.js        contextBridge — the only surface the UI can touch

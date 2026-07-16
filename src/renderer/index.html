@@ -34,6 +34,12 @@
         <button class="nav-item" data-view="assistant">
           <span class="nav-ico">✦</span> AI assistant
         </button>
+        <button class="nav-item" data-view="updates">
+          <span class="nav-ico">⭳</span> App updates
+        </button>
+        <button class="nav-item" data-view="startup">
+          <span class="nav-ico">⏻</span> Startup apps
+        </button>
         <button class="nav-item" data-view="settings">
           <span class="nav-ico">⚙</span> Settings
         </button>
@@ -182,6 +188,33 @@
             <button type="submit" class="primary-btn" id="chat-send">Send</button>
           </form>
         </div>
+      </section>
+
+      <!-- View: App updates (winget) -->
+      <section class="view view-list" data-view="updates">
+        <div class="list-head">
+          <h2>App updates <span class="win-tag">winget</span></h2>
+          <div class="list-tools">
+            <button class="ghost-btn" id="check-updates">Check for updates</button>
+            <button class="ghost-btn" id="updates-upgrade-selected" disabled>Upgrade selected</button>
+            <button class="primary-btn" id="updates-upgrade-all" disabled>Upgrade all</button>
+          </div>
+        </div>
+        <div id="updates-summary" class="dupes-summary"></div>
+        <div class="table-wrap"><table class="data-table" id="updates-table"><tbody></tbody></table></div>
+        <div class="console-out" id="updates-console" hidden></div>
+      </section>
+
+      <!-- View: Startup apps -->
+      <section class="view view-list" data-view="startup">
+        <div class="list-head">
+          <h2>Startup apps <span class="win-tag">Windows</span></h2>
+          <div class="list-tools">
+            <button class="ghost-btn" id="refresh-startup">Refresh</button>
+          </div>
+        </div>
+        <div id="startup-summary" class="dupes-summary"></div>
+        <div class="table-wrap"><table class="data-table" id="startup-table"><tbody></tbody></table></div>
       </section>
 
       <!-- View: Settings -->

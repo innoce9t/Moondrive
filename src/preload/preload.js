@@ -49,6 +49,22 @@ const api = {
   system: {
     info: () => ipcRenderer.invoke('system:info'),
   },
+
+  winget: {
+    available: () => ipcRenderer.invoke('winget:available'),
+    list: () => ipcRenderer.invoke('winget:list'),
+    upgrade: (ids) => ipcRenderer.invoke('winget:upgrade', ids),
+    onProgress: (cb) => {
+      const listener = (_e, data) => cb(data);
+      ipcRenderer.on('winget:progress', listener);
+      return () => ipcRenderer.removeListener('winget:progress', listener);
+    },
+  },
+
+  startup: {
+    list: () => ipcRenderer.invoke('startup:list'),
+    set: (entry, enable) => ipcRenderer.invoke('startup:set', { entry, enable }),
+  },
 };
 
 contextBridge.exposeInMainWorld('moondrive', api);

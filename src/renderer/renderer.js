@@ -16,6 +16,8 @@ const state = {
   selectedNode: null,
   chatHistory: [], // {role, content}
   duplicates: null,
+  updates: null, // { supported, items }
+  startup: null, // { supported, items }
 };
 
 let graph = null;
@@ -138,6 +140,7 @@ async function init() {
   renderFolderLists();
   bindUI();
   bindScanProgress();
+  bindWingetProgress();
   hydrateSettings();
 }
 
@@ -683,6 +686,254 @@ async function saveAiSettings() {
 }
 
 // ------------------------------------------------------------
+// App updates (winget)
+// ------------------------------------------------------------
+function unsupportedRow(table, icon, message) {
+  const tbody = $(table).querySelector('tbody');
+  tbody.innerHTML = `<tr><td colspan="6"><div class="unsupported-notice"><div class="un-ico">${icon}</div><p>${message}</p></div></td></tr>`;
+}
+
+async function checkUpdates() {
+  const btn = $('#check-updates');
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  $('#updates-summary').textContent = 'Querying winget for available upgrades…';
+  try {
+    const res = await md.winget.list();
+    state.updates = res;
+    renderUpdates();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Check for updates';
+  }
+}
+
+function renderUpdates() {
+  const res = state.updates;
+  const tbody = $('#updates-table').querySelector('tbody');
+  tbody.innerHTML = '';
+
+  if (!res || !res.supported) {
+    $('#updates-summary').textContent = '';
+    unsupportedRow('#updates-table', '⊘', (res && res.reason) || 'winget package updates are only available on Windows.');
+    $('#updates-upgrade-all').disabled = true;
+    $('#updates-upgrade-selected').disabled = true;
+    return;
+  }
+
+  const items = res.items || [];
+  $('#updates-summary').textContent = items.length
+    ? `${items.length} update${items.length === 1 ? '' : 's'} available`
+    : 'Everything is up to date. 🎉';
+  $('#updates-upgrade-all').disabled = items.length === 0;
+
+  items.forEach((it) => {
+    const tr = document.createElement('tr');
+    tr.dataset.id = it.id;
+    tr.innerHTML = `
+      <td class="cell-check"><input type="checkbox" data-id="${encodeURIComponent(it.id)}"></td>
+      <td>
+        <div class="file-name-cell">
+          <div style="min-width:0">
+            <div class="file-name">${escapeHtml(it.name)}</div>
+            <div class="upd-id">${escapeHtml(it.id)}${it.source ? ' · ' + escapeHtml(it.source) : ''}</div>
+          </div>
+        </div>
+      </td>
+      <td class="upd-version">
+        <span class="from">${escapeHtml(it.version)}</span>
+        <span class="arrow">→</span>
+        <span class="to">${escapeHtml(it.available)}</span>
+      </td>
+      <td class="upd-status"></td>`;
+    tr.querySelector('input').addEventListener('change', updateUpdatesSelection);
+    tbody.appendChild(tr);
+  });
+  updateUpdatesSelection();
+}
+
+function updateUpdatesSelection() {
+  const checked = $$('#updates-table input:checked');
+  $('#updates-upgrade-selected').disabled = checked.length === 0;
+  $('#updates-upgrade-selected').textContent = checked.length ? `Upgrade ${checked.length} selected` : 'Upgrade selected';
+}
+
+async function runUpgrade(ids) {
+  if (!ids.length) return;
+  const consoleEl = $('#updates-console');
+  consoleEl.hidden = false;
+  consoleEl.textContent = '';
+  ids.forEach((id) => setUpdateStatus(id, '<span class="badge-upgrading">upgrading…</span>'));
+  $('#updates-upgrade-all').disabled = true;
+  $('#updates-upgrade-selected').disabled = true;
+  $('#check-updates').disabled = true;
+
+  const res = await md.winget.upgrade(ids);
+  $('#check-updates').disabled = false;
+
+  if (!res.supported) {
+    toast(res.reason || 'winget unavailable', 'error');
+    return;
+  }
+  let ok = 0;
+  res.results.forEach((r) => {
+    if (r.ok) {
+      ok++;
+      setUpdateStatus(r.id, '<span class="badge-done">✓ updated</span>');
+    } else {
+      setUpdateStatus(r.id, `<span class="badge-fail">failed${r.code ? ' (' + r.code + ')' : ''}</span>`);
+    }
+  });
+  toast(`Upgraded ${ok}/${res.results.length} app${res.results.length === 1 ? '' : 's'}`, ok ? 'success' : 'error');
+  // Refresh the list after a short delay so completed items drop off.
+  setTimeout(checkUpdates, 1200);
+}
+
+function setUpdateStatus(id, html) {
+  const row = $(`#updates-table tr[data-id="${cssEscape(id)}"]`);
+  if (row) row.querySelector('.upd-status').innerHTML = html;
+}
+
+function bindWingetProgress() {
+  md.winget.onProgress(({ id, line }) => {
+    const consoleEl = $('#updates-console');
+    consoleEl.hidden = false;
+    const div = document.createElement('div');
+    div.innerHTML = `<span class="con-id">${escapeHtml(shortId(id))}</span>  ${escapeHtml(line)}`;
+    consoleEl.appendChild(div);
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  });
+}
+
+function shortId(id) {
+  return id.length > 24 ? id.slice(0, 23) + '…' : id;
+}
+
+async function upgradeSelectedUpdates() {
+  const ids = $$('#updates-table input:checked').map((c) => decodeURIComponent(c.dataset.id));
+  const ok = await confirmModal({
+    title: `Upgrade ${ids.length} app${ids.length === 1 ? '' : 's'}?`,
+    body: 'winget will download and install the selected upgrades silently. This may take a few minutes.',
+    confirmText: 'Upgrade',
+    danger: false,
+  });
+  if (ok) runUpgrade(ids);
+}
+
+async function upgradeAllUpdates() {
+  const ids = (state.updates?.items || []).map((i) => i.id);
+  const ok = await confirmModal({
+    title: `Upgrade all ${ids.length} apps?`,
+    body: 'winget will download and install every available upgrade silently. This may take a while.',
+    confirmText: 'Upgrade all',
+    danger: false,
+  });
+  if (ok) runUpgrade(ids);
+}
+
+// ------------------------------------------------------------
+// Startup apps
+// ------------------------------------------------------------
+async function refreshStartup() {
+  const btn = $('#refresh-startup');
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  $('#startup-summary').textContent = 'Reading startup entries…';
+  try {
+    const res = await md.startup.list();
+    state.startup = res;
+    renderStartup();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Refresh';
+  }
+}
+
+function renderStartup() {
+  const res = state.startup;
+  const tbody = $('#startup-table').querySelector('tbody');
+  tbody.innerHTML = '';
+
+  if (!res || !res.supported) {
+    $('#startup-summary').textContent = '';
+    unsupportedRow('#startup-table', '⊘', (res && res.reason) || 'Startup-app management is only available on Windows.');
+    return;
+  }
+  if (res.error) {
+    $('#startup-summary').textContent = '';
+    unsupportedRow('#startup-table', '⚠', res.error);
+    return;
+  }
+
+  const items = res.items || [];
+  const enabled = items.filter((i) => i.enabled).length;
+  $('#startup-summary').textContent = items.length
+    ? `${items.length} startup entries · ${enabled} enabled`
+    : 'No startup entries found.';
+
+  items.forEach((it, idx) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>
+        <div class="file-name-cell">
+          <div style="min-width:0">
+            <div class="file-name">${escapeHtml(it.name || '(unnamed)')}</div>
+            <div class="startup-cmd" title="${escapeHtml(it.command || '')}">${escapeHtml(it.command || '')}</div>
+          </div>
+        </div>
+      </td>
+      <td class="startup-loc">${escapeHtml(prettyLocation(it.location))}${it.user ? ' · ' + escapeHtml(it.user) : ''}</td>
+      <td class="cell-actions"><div class="toggle ${it.enabled ? 'on' : ''}" role="switch" aria-checked="${it.enabled}"></div></td>`;
+    const toggle = tr.querySelector('.toggle');
+    toggle.addEventListener('click', () => toggleStartup(it, toggle));
+    tbody.appendChild(tr);
+  });
+}
+
+function prettyLocation(loc) {
+  if (!loc) return '';
+  if (/HKLM/i.test(loc)) return 'Machine · Registry';
+  if (/HKU|HKCU/i.test(loc)) return 'User · Registry';
+  if (/common/i.test(loc)) return 'Machine · Startup folder';
+  if (/startup/i.test(loc)) return 'User · Startup folder';
+  return loc;
+}
+
+async function toggleStartup(entry, toggleEl) {
+  const enable = !entry.enabled;
+  toggleEl.classList.add('busy');
+  const res = await md.startup.set(entry, enable);
+  toggleEl.classList.remove('busy');
+  if (!res.supported) {
+    toast(res.reason || 'Not supported', 'error');
+    return;
+  }
+  if (!res.ok) {
+    toast(res.error || 'Could not change this entry', 'error', 5000);
+    return;
+  }
+  entry.enabled = enable;
+  toggleEl.classList.toggle('on', enable);
+  toggleEl.setAttribute('aria-checked', String(enable));
+  const items = state.startup.items || [];
+  const en = items.filter((i) => i.enabled).length;
+  $('#startup-summary').textContent = `${items.length} startup entries · ${en} enabled`;
+  toast(`${entry.name} ${enable ? 'enabled' : 'disabled'} at startup`, 'success');
+}
+
+// small helpers
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function cssEscape(s) {
+  return String(s).replace(/["\\]/g, '\\$&');
+}
+
+// ------------------------------------------------------------
 // View switching
 // ------------------------------------------------------------
 function switchView(view) {
@@ -690,6 +941,8 @@ function switchView(view) {
   $$('.view').forEach((v) => v.classList.toggle('active', v.dataset.view === view));
   if (view === 'largest') renderLargest();
   if (view === 'duplicates' && !state.duplicates) $('#dupes-summary').textContent = 'Click “Find duplicates” to scan for repeated files.';
+  if (view === 'updates' && !state.updates) checkUpdates();
+  if (view === 'startup' && !state.startup) refreshStartup();
 }
 
 // ------------------------------------------------------------
@@ -721,6 +974,14 @@ function bindUI() {
   $('#largest-trash-selected').addEventListener('click', trashSelectedLargest);
   $('#find-dupes').addEventListener('click', findDuplicates);
   $('#dupes-trash-selected').addEventListener('click', trashSelectedDupes);
+
+  // updates (winget)
+  $('#check-updates').addEventListener('click', checkUpdates);
+  $('#updates-upgrade-selected').addEventListener('click', upgradeSelectedUpdates);
+  $('#updates-upgrade-all').addEventListener('click', upgradeAllUpdates);
+
+  // startup apps
+  $('#refresh-startup').addEventListener('click', refreshStartup);
 
   // chat
   $('#chat-form').addEventListener('submit', (e) => {

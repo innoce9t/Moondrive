@@ -9,6 +9,7 @@ const fsp = fs.promises;
 const { ScanSession, findDuplicates } = require('./scanner');
 const gemini = require('./gemini');
 const { Store } = require('./store');
+const systemTools = require('./system-tools');
 
 const isDev = process.argv.includes('--dev');
 
@@ -252,6 +253,21 @@ function registerIpc() {
     home: os.homedir(),
     hostname: os.hostname(),
   }));
+
+  // --- Package updates (winget) ------------------------------------------
+  ipcMain.handle('winget:available', () => systemTools.wingetAvailable());
+  ipcMain.handle('winget:list', () => systemTools.wingetListUpgrades());
+  ipcMain.handle('winget:upgrade', (_e, ids) =>
+    systemTools.wingetUpgrade(ids, (id, line) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('winget:progress', { id, line });
+      }
+    })
+  );
+
+  // --- Startup apps -------------------------------------------------------
+  ipcMain.handle('startup:list', () => systemTools.listStartupApps());
+  ipcMain.handle('startup:set', (_e, { entry, enable }) => systemTools.setStartupApp(entry, enable));
 }
 
 // ---------------------------------------------------------------------------
