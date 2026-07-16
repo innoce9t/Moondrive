@@ -26,11 +26,28 @@ removal goes to your system Trash, never a hard delete).
 - **↻ Scan history** — every scan is recorded, so you can watch a folder's size
   trend over time. Each entry shows a sparkline, the size delta since the last
   scan of that path, and a one-click rescan.
-- **🔍 Deep, concurrent scanner** — walks the tree with **bounded-concurrency
-  I/O** (many `readdir`/`stat` calls in flight at once via a semaphore) instead
-  of one-at-a-time, which is dramatically faster on real drives where per-file
-  latency dominates — while the cap prevents file-descriptor exhaustion. Streams
-  live progress, tolerates permission errors, and skips symlinks by default.
+- **🔍 Deep, fast, correct scanner** — engineered for large drives:
+  - **Bounded-concurrency I/O** (a semaphore keeps many `readdir`/`stat` calls
+    in flight without exhausting file descriptors) — dramatically faster on real
+    drives where per-file latency dominates.
+  - **Optional worker-thread parallelism** — splits top-level subtrees across
+    CPU cores for even more throughput on many-core machines.
+  - **Progressive rendering** — the graph and treemap fill in *live* as
+    subtrees complete, instead of waiting for the whole scan.
+  - **Lazy tree over IPC** — the full tree stays in the main process; the UI
+    receives only the level it's showing and fetches deeper levels on demand, so
+    memory and IPC stay bounded even at millions of files.
+  - **Incremental "fast rescan"** — reuses folders whose timestamp is unchanged,
+    making repeat scans of a mostly-static drive near-instant.
+  - **Correct accounting** — a bounded min-heap for top-largest tracking,
+    hardlink/inode dedup (a hardlinked file's bytes count once), on-disk
+    *allocated* size alongside logical size, and access/modify times.
+  - **Boundary guarding** — skips recycle bins and pseudo filesystems
+    (`/proc`, `/sys`, `System Volume Information`…), with an optional
+    stay-on-one-drive mode so it won't wander into network mounts.
+  - Streams live progress, tolerates permission errors, and skips symlinks by
+    default. An optional **drive watcher** nudges you to rescan when the folder
+    changes.
 - **🗂 Largest files & duplicate finder** — instantly surface the biggest space
   hogs, and detect duplicate files (grouped by size + content fingerprint) with
   a one-click "reclaimable space" estimate.
@@ -76,7 +93,9 @@ src/
 │   ├── main.js           App lifecycle + all IPC handlers (sandbox-gated)
 │   ├── scanner.js        Recursive, cancellable scan + duplicate detection
 │   ├── gemini.js         Minimal Gemini REST client + privacy-safe summariser
-│   ├── system-tools.js   winget upgrades + Windows startup-app management
+│   ├── system-tools.js   winget upgrades + Windows startup/uninstall management
+│   ├── parallel-scan.js  Worker-pool scanner (splits subtrees across threads)
+│   ├── scanner-worker.js Worker entry point for a single subtree scan
 │   └── store.js          Local JSON settings + the sandbox allow-list gate
 ├── preload/
 │   └── preload.js        contextBridge — the only surface the UI can touch

@@ -65,30 +65,147 @@ class Semaphore {
 }
 
 /**
+ * A bounded min-heap that keeps the top-K largest items by `size`. Inserting is
+ * O(log k), versus re-sorting a capped array on every insert. The root of the
+ * heap is always the smallest of the retained items, so we can reject a new
+ * candidate in O(1) once the heap is full.
+ */
+class BoundedMaxByMinHeap {
+  constructor(cap) {
+    this.cap = cap;
+    this.a = []; // binary min-heap by size
+  }
+  get size() {
+    return this.a.length;
+  }
+  add(item) {
+    const a = this.a;
+    if (a.length < this.cap) {
+      a.push(item);
+      this._up(a.length - 1);
+    } else if (item.size > a[0].size) {
+      a[0] = item;
+      this._down(0);
+    }
+  }
+  toSortedDesc() {
+    return this.a.slice().sort((x, y) => y.size - x.size);
+  }
+  _up(i) {
+    const a = this.a;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (a[p].size <= a[i].size) break;
+      [a[p], a[i]] = [a[i], a[p]];
+      i = p;
+    }
+  }
+  _down(i) {
+    const a = this.a;
+    const n = a.length;
+    for (;;) {
+      let s = i;
+      const l = 2 * i + 1;
+      const r = 2 * i + 2;
+      if (l < n && a[l].size < a[s].size) s = l;
+      if (r < n && a[r].size < a[s].size) s = r;
+      if (s === i) break;
+      [a[s], a[i]] = [a[i], a[s]];
+      i = s;
+    }
+  }
+}
+
+// Directory names to skip anywhere (recycle bins, restore points, trashes).
+const SKIP_DIR_NAMES = new Set([
+  '$recycle.bin',
+  'system volume information',
+  '$sysreset',
+  '.trash',
+  '.trashes',
+  '.spotlight-v100',
+  '.fseventsd',
+]);
+
+// Absolute pseudo/virtual filesystem roots to skip on a root scan.
+const PSEUDO_PATHS = new Set(
+  process.platform === 'win32'
+    ? []
+    : ['/proc', '/sys', '/dev', '/run', '/var/run', '/private/var/vm']
+);
+
+/**
  * A scan session. Handles a single recursive walk of a root path, streaming
  * progress and remaining cancellable. Produces an aggregated tree.
  *
  * The walk runs many directory reads and file stats concurrently (bounded by
  * `concurrency`) instead of sequentially, which is a large speed-up on real
  * drives where the bottleneck is I/O latency, not CPU.
+ *
+ * Options:
+ *  - followSymlinks     descend into symlinked directories (default false)
+ *  - concurrency        max in-flight fs operations (default 48)
+ *  - sameDeviceOnly     do not cross filesystem/mount boundaries (default false)
+ *  - skipSystemPaths    skip recycle bins / pseudo filesystems (default true)
+ *  - dedupHardlinks     count a hardlinked inode's bytes once in totals (default true)
+ *  - previousTree       a prior scan's root node, enabling incremental reuse
+ *  - fastRescan         reuse subtrees whose directory mtime is unchanged (needs previousTree)
+ *  - onSubtree(node)    called when a direct child of the root finishes (progressive UI)
  */
 class ScanSession {
-  constructor(rootPath, { onProgress, followSymlinks = false, concurrency = 48 } = {}) {
+  constructor(rootPath, opts = {}) {
+    const {
+      onProgress,
+      onSubtree,
+      followSymlinks = false,
+      concurrency = 48,
+      sameDeviceOnly = false,
+      skipSystemPaths = true,
+      dedupHardlinks = true,
+      previousTree = null,
+      fastRescan = false,
+      recordDirMtimes = false,
+    } = opts;
+
     this.rootPath = rootPath;
     this.onProgress = onProgress || (() => {});
+    this.onSubtree = onSubtree || (() => {});
     this.followSymlinks = followSymlinks;
+    this.sameDeviceOnly = sameDeviceOnly;
+    this.skipSystemPaths = skipSystemPaths;
+    this.dedupHardlinks = dedupHardlinks;
+    this.fastRescan = fastRescan && !!previousTree;
     this.cancelled = false;
+
     this.stats = {
       files: 0,
       dirs: 0,
       totalSize: 0,
+      totalAllocated: 0, // on-disk (block-allocated) bytes
       errors: 0,
+      reused: 0, // directories reused from a previous scan
       byCategory: {},
-      largest: [], // {path, size} kept sorted desc, capped
+      largest: [],
     };
+
     this._lastEmit = 0;
     this._largestCap = 200;
+    this._heap = new BoundedMaxByMinHeap(this._largestCap);
     this._sem = new Semaphore(Math.max(4, concurrency));
+    this._seenInodes = dedupHardlinks ? new Set() : null;
+    this._rootDev = null;
+
+    // Whether we must stat directories (to read dev for boundary checks, or
+    // mtime for incremental reuse / recording). When false we skip the dir
+    // stat entirely — saving one syscall per directory.
+    this._needDirStat = this.sameDeviceOnly || this.fastRescan || recordDirMtimes;
+
+    // Build a path -> node index of the previous tree for incremental reuse.
+    this._prevIndex = null;
+    if (this.fastRescan) {
+      this._prevIndex = new Map();
+      buildPathIndex(previousTree, this._prevIndex);
+    }
   }
 
   cancel() {
@@ -104,18 +221,12 @@ class ScanSession {
       dirs: this.stats.dirs,
       totalSize: this.stats.totalSize,
       errors: this.stats.errors,
+      reused: this.stats.reused,
     });
   }
 
   _trackLargest(filePath, size) {
-    const arr = this.stats.largest;
-    if (arr.length < this._largestCap) {
-      arr.push({ path: filePath, size });
-      arr.sort((a, b) => b.size - a.size);
-    } else if (size > arr[arr.length - 1].size) {
-      arr[arr.length - 1] = { path: filePath, size };
-      arr.sort((a, b) => b.size - a.size);
-    }
+    this._heap.add({ path: filePath, size });
   }
 
   async run() {
@@ -123,7 +234,10 @@ class ScanSession {
     if (!rootStat) {
       throw new Error(`Cannot access ${this.rootPath}`);
     }
+    this._rootDev = rootStat.dev;
     const node = await this._walk(this.rootPath, rootStat, 0);
+    // Materialise the top-K largest files from the heap, sorted desc.
+    this.stats.largest = this._heap.toSortedDesc();
     this._emit(true);
     return {
       root: node,
@@ -179,6 +293,8 @@ class ScanSession {
     }
 
     // Stat all files in this directory concurrently (bounded by the semaphore).
+    // The file stat also gives us dev/ino (hardlink dedup), atime, and the
+    // block-allocated size — all for free, no extra syscalls.
     const fileResults = await Promise.all(
       fileEntries.map(async (entry) => {
         if (this.cancelled) return null;
@@ -187,41 +303,96 @@ class ScanSession {
         if (!fstat) return null;
         const ext = extensionOf(entry.name);
         return {
-          name: entry.name,
-          path: childPath,
-          type: 'file',
-          size: fstat.size,
-          ext,
-          category: categorize(ext),
-          mtimeMs: fstat.mtimeMs,
+          node: {
+            name: entry.name,
+            path: childPath,
+            type: 'file',
+            size: fstat.size,
+            ext,
+            category: categorize(ext),
+            mtimeMs: fstat.mtimeMs,
+            atimeMs: fstat.atimeMs,
+            allocSize: fstat.blocks != null ? fstat.blocks * 512 : fstat.size,
+          },
+          dev: fstat.dev,
+          ino: fstat.ino,
+          nlink: fstat.nlink,
         };
       })
     );
 
-    for (const file of fileResults) {
-      if (!file) continue;
-      this.stats.files++;
-      this.stats.totalSize += file.size;
-      const c = (this.stats.byCategory[file.category] = this.stats.byCategory[file.category] || { count: 0, size: 0 });
-      c.count++;
-      c.size += file.size;
-      this._trackLargest(file.path, file.size);
+    for (const r of fileResults) {
+      if (!r) continue;
+      const file = r.node;
+      // The node is always added to the tree so the folder shows all its files.
+      node.children.push(file);
       node.size += file.size;
       node.childCount += 1;
-      node.children.push(file);
+
+      // For global totals, count a hardlinked inode's bytes only once.
+      let alreadySeen = false;
+      if (this._seenInodes && r.nlink > 1 && r.ino) {
+        const key = `${r.dev}:${r.ino}`;
+        if (this._seenInodes.has(key)) alreadySeen = true;
+        else this._seenInodes.add(key);
+      }
+
+      this.stats.files++;
+      if (!alreadySeen) {
+        this.stats.totalSize += file.size;
+        this.stats.totalAllocated += file.allocSize;
+        const c = (this.stats.byCategory[file.category] =
+          this.stats.byCategory[file.category] || { count: 0, size: 0 });
+        c.count++;
+        c.size += file.size;
+        this._trackLargest(file.path, file.size);
+      }
     }
     this._emit();
 
     // Recurse into subdirectories concurrently. Each child walk gates its own
     // fs operations through the shared semaphore, so total in-flight I/O stays
     // capped no matter how wide or deep the tree is.
+    const atDepth0 = depth === 0;
     const childDirs = await Promise.all(
       dirEntries.map(async (entry) => {
         if (this.cancelled) return null;
         const childPath = path.join(dirPath, entry.name);
-        const dstat = await this._safeStat(childPath);
-        if (!dstat || !dstat.isDirectory()) return null;
-        return this._walk(childPath, dstat, depth + 1);
+        const nameLower = entry.name.toLowerCase();
+
+        // Boundary guarding: recycle bins, restore points, pseudo filesystems.
+        if (this.skipSystemPaths && (SKIP_DIR_NAMES.has(nameLower) || PSEUDO_PATHS.has(childPath))) {
+          return null;
+        }
+
+        // We only stat the directory when we actually need dev (same-device
+        // guard) or mtime (incremental reuse). Otherwise the readdir Dirent
+        // already told us it's a directory — saving one syscall per folder.
+        let dstat = null;
+        if (this._needDirStat) {
+          dstat = await this._safeStat(childPath);
+          if (!dstat || !dstat.isDirectory()) return null;
+          if (this.sameDeviceOnly && this._rootDev != null && dstat.dev !== this._rootDev) {
+            return null; // different mount / device
+          }
+        }
+
+        // Incremental reuse: if the folder's mtime matches the previous scan,
+        // reuse the cached subtree instead of re-reading it from disk.
+        if (this.fastRescan && dstat) {
+          const prev = this._prevIndex.get(childPath);
+          if (prev && prev.type === 'dir' && prev.mtimeMs === dstat.mtimeMs) {
+            this.stats.reused++;
+            this._absorbReusedSubtree(prev); // fold its stats in (in-memory only)
+            const child = clonePrevSubtree(prev);
+            if (atDepth0 && child) this.onSubtree(child);
+            return child;
+          }
+        }
+
+        const child = await this._walk(childPath, dstat || { mtimeMs: 0 }, depth + 1);
+        if (atDepth0 && child) this.onSubtree(child);
+        return child;
       })
     );
 
@@ -237,6 +408,69 @@ class ScanSession {
     this._emit();
     return node;
   }
+
+  // Fold a reused subtree's stats into the running totals (in-memory only —
+  // no disk I/O). Note: hardlink dedup is best-effort across reused subtrees.
+  _absorbReusedSubtree(prevNode) {
+    walkPrev(prevNode, (n) => {
+      if (n.type === 'file') {
+        this.stats.files++;
+        this.stats.totalSize += n.size;
+        this.stats.totalAllocated += n.allocSize != null ? n.allocSize : n.size;
+        const c = (this.stats.byCategory[n.category] =
+          this.stats.byCategory[n.category] || { count: 0, size: 0 });
+        c.count++;
+        c.size += n.size;
+        this._trackLargest(n.path, n.size);
+      } else if (n.type === 'dir') {
+        this.stats.dirs++;
+      }
+    });
+  }
+}
+
+// ---- incremental-scan helpers ---------------------------------------------
+
+function buildPathIndex(node, map) {
+  if (!node) return;
+  map.set(node.path, node);
+  if (node.children) for (const c of node.children) buildPathIndex(c, map);
+}
+
+function walkPrev(node, cb) {
+  cb(node);
+  if (node.children) for (const c of node.children) walkPrev(c, cb);
+}
+
+/** Deep structural clone of a previous subtree, so the new tree owns its nodes. */
+function clonePrevSubtree(node) {
+  const copy = { ...node };
+  if (node.children) copy.children = node.children.map(clonePrevSubtree);
+  return copy;
+}
+
+/**
+ * Merge a batch of stats objects (from worker threads or subtree scans) into
+ * one. Totals add, byCategory merges, and the largest lists are combined and
+ * re-capped. Used by the worker-parallel scanner.
+ */
+function mergeStats(target, src, largestCap = 200) {
+  target.files += src.files;
+  target.dirs += src.dirs;
+  target.totalSize += src.totalSize;
+  target.totalAllocated += src.totalAllocated || 0;
+  target.errors += src.errors;
+  target.reused = (target.reused || 0) + (src.reused || 0);
+  for (const [cat, v] of Object.entries(src.byCategory || {})) {
+    const c = (target.byCategory[cat] = target.byCategory[cat] || { count: 0, size: 0 });
+    c.count += v.count;
+    c.size += v.size;
+  }
+  const heap = new BoundedMaxByMinHeap(largestCap);
+  for (const it of target.largest || []) heap.add(it);
+  for (const it of src.largest || []) heap.add(it);
+  target.largest = heap.toSortedDesc();
+  return target;
 }
 
 /**
@@ -414,4 +648,10 @@ module.exports = {
   findJunk,
   categorize,
   CATEGORY_MAP,
+  mergeStats,
+  buildPathIndex,
+  clonePrevSubtree,
+  extensionOf,
+  SKIP_DIR_NAMES,
+  PSEUDO_PATHS,
 };

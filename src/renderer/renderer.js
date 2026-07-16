@@ -152,6 +152,8 @@ async function init() {
   renderFolderLists();
   bindUI();
   bindScanProgress();
+  bindScanPartial();
+  bindDriveChanged();
   bindWingetProgress();
   bindAppsProgress();
   hydrateSettings();
@@ -232,33 +234,96 @@ function bindScanProgress() {
     $('#scan-files').textContent = formatNumber(p.files);
     $('#scan-dirs').textContent = formatNumber(p.dirs);
     $('#scan-size').textContent = formatBytes(p.totalSize);
+    // keep the compact live banner in sync too
+    $('#scan-banner-files').textContent = formatNumber(p.files);
+    $('#scan-banner-size').textContent = formatBytes(p.totalSize);
+    if (p.reused) $('#scan-banner-reused').textContent = ` · ${formatNumber(p.reused)} folders reused`;
   });
+}
+
+// Progressive rendering: as each top-level subtree completes, it streams in and
+// fills the graph/treemap live.
+function bindScanPartial() {
+  md.scan.onPartial(({ rootPath, child }) => {
+    if (!state.scanning || !state.scan || state.scan.root.path !== rootPath) return;
+    state.scan.root.children.push(child);
+    state.scan.root.size += child.size;
+    // Reveal the live-filling graph: swap the blocking overlay for a slim banner.
+    $('#scan-overlay').hidden = true;
+    $('#scan-banner').hidden = false;
+    scheduleLiveRefresh();
+  });
+}
+
+function bindDriveChanged() {
+  md.scan.onDriveChanged(() => {
+    // Only nudge when we're not mid-scan and are viewing the graph.
+    if (state.scanning || !state.scan) return;
+    $('#drive-changed').hidden = false;
+  });
+}
+
+let _liveRefreshTimer = null;
+function scheduleLiveRefresh() {
+  if (_liveRefreshTimer) return;
+  _liveRefreshTimer = setTimeout(() => {
+    _liveRefreshTimer = null;
+    if (state.scanning && state.scan && currentFolder() === state.scan.root) {
+      state.scan.root.children.sort((a, b) => b.size - a.size);
+      graph.setFolder(state.scan.root);
+      if (treemap) treemap.setFolder(state.scan.root);
+    }
+  }, 220);
 }
 
 async function startScan(folderPath) {
   switchView('graph');
   $('#empty-state').classList.add('hidden');
+
+  // Live root the graph renders into while the scan streams subtrees in.
+  const liveRoot = {
+    name: basename(folderPath) || folderPath,
+    path: folderPath,
+    type: 'dir',
+    category: 'folder',
+    size: 0,
+    childCount: 0,
+    children: [],
+  };
+  state.scan = { root: liveRoot, stats: { files: 0, dirs: 0, totalSize: 0, errors: 0, byCategory: {}, largest: [] } };
+  state.navStack = [liveRoot];
+  state.duplicates = null;
+  state.junk = null;
+  state.scanning = true;
+  renderBreadcrumbs();
+  graph.setFolder(liveRoot);
+
   const overlay = $('#scan-overlay');
   overlay.hidden = false;
+  $('#scan-banner').hidden = true;
   $('#scan-title').textContent = 'Scanning…';
   $('#scan-path').textContent = folderPath;
   $('#scan-files').textContent = '0';
   $('#scan-dirs').textContent = '0';
   $('#scan-size').textContent = '0 B';
+  $('#scan-banner-reused').textContent = '';
 
   const result = await md.scan.start(folderPath);
+  state.scanning = false;
   overlay.hidden = true;
+  $('#scan-banner').hidden = true;
 
   if (!result.ok) {
     toast(result.error || 'Scan failed', 'error', 5000);
-    if (!state.scan) $('#empty-state').classList.remove('hidden');
+    state.scan = null;
+    $('#empty-state').classList.remove('hidden');
     return;
   }
 
+  // Authoritative final result (sorted, complete).
+  result.root.children = result.children;
   state.scan = { root: result.root, stats: result.stats };
   state.navStack = [result.root];
-  state.duplicates = null;
-  state.junk = null;
   $('#rescan-btn').disabled = false;
   $('#organize-btn').disabled = false;
 
@@ -266,9 +331,10 @@ async function startScan(folderPath) {
   renderCurrentFolder();
   renderLargest();
 
-  const skipped = result.stats.errors ? ` · ${formatNumber(result.stats.errors)} items skipped` : '';
+  const skipped = result.stats.errors ? ` · ${formatNumber(result.stats.errors)} skipped` : '';
+  const reused = result.stats.reused ? ` · ${formatNumber(result.stats.reused)} folders reused` : '';
   toast(
-    `Scanned ${formatNumber(result.stats.files)} files · ${formatBytes(result.stats.totalSize)}${skipped}`,
+    `Scanned ${formatNumber(result.stats.files)} files · ${formatBytes(result.stats.totalSize)}${skipped}${reused}`,
     'success',
     4200
   );
@@ -287,9 +353,23 @@ function currentFolder() {
   return state.navStack[state.navStack.length - 1];
 }
 
-function renderCurrentFolder() {
+/**
+ * Lazy loading: nodes arrive from main without their `children`. Fetch a
+ * folder's direct children on demand the first time we need them.
+ */
+async function ensureChildren(node) {
+  if (!node || node.type !== 'dir') return;
+  if (node.children) return; // already loaded (or a synthetic/group folder)
+  const res = await md.scan.getChildren(node.path);
+  node.children = res && res.ok ? res.children : [];
+}
+
+async function renderCurrentFolder() {
   const folder = currentFolder();
   if (!folder) return;
+  await ensureChildren(folder);
+  // The folder may have changed while awaiting (fast navigation); re-check.
+  if (currentFolder() !== folder) return;
   graph.setFolder(folder);
   if (treemap) {
     treemap.setFolder(folder);
@@ -716,9 +796,17 @@ function autoGrow(el) {
 // Settings
 // ------------------------------------------------------------
 function hydrateSettings() {
-  $('#gemini-key').value = state.settings.geminiApiKey || '';
-  $('#gemini-model').value = state.settings.geminiModel || 'gemini-2.0-flash';
-  $('#follow-symlinks').checked = !!state.settings.followSymlinks;
+  const s = state.settings;
+  $('#gemini-key').value = s.geminiApiKey || '';
+  $('#gemini-model').value = s.geminiModel || 'gemini-2.0-flash';
+  $('#follow-symlinks').checked = !!s.followSymlinks;
+  $('#skip-system-paths').checked = s.skipSystemPaths !== false;
+  $('#same-device').checked = !!s.sameDeviceOnly;
+  $('#dedup-hardlinks').checked = s.dedupHardlinks !== false;
+  $('#use-workers').checked = !!s.useWorkers;
+  $('#fast-rescan').checked = !!s.fastRescan;
+  $('#watch-drive').checked = !!s.watchDrive;
+  $('#scan-concurrency').value = s.scanConcurrency || 48;
 }
 
 async function saveAiSettings() {
@@ -1593,6 +1681,12 @@ function bindUI() {
   });
 
   $('#scan-cancel').addEventListener('click', () => md.scan.cancel());
+  $('#scan-banner-cancel').addEventListener('click', () => md.scan.cancel());
+  $('#drive-changed-rescan').addEventListener('click', () => {
+    $('#drive-changed').hidden = true;
+    if (state.scan) startScan(state.scan.root.path);
+  });
+  $('#drive-changed-dismiss').addEventListener('click', () => ($('#drive-changed').hidden = true));
 
   // graph controls
   $('#zoom-in').addEventListener('click', () => graph.zoomIn());
@@ -1661,6 +1755,25 @@ function bindUI() {
   $('#follow-symlinks').addEventListener('change', async (e) => {
     state.settings = await md.settings.set('followSymlinks', e.target.checked);
     toast('Symlink preference saved', 'info');
+  });
+
+  // scan/performance toggles
+  const scanToggle = (id, key) =>
+    $(id).addEventListener('change', async (e) => {
+      state.settings = await md.settings.set(key, e.target.checked);
+      toast('Scan setting saved', 'info', 1600);
+    });
+  scanToggle('#skip-system-paths', 'skipSystemPaths');
+  scanToggle('#same-device', 'sameDeviceOnly');
+  scanToggle('#dedup-hardlinks', 'dedupHardlinks');
+  scanToggle('#use-workers', 'useWorkers');
+  scanToggle('#fast-rescan', 'fastRescan');
+  scanToggle('#watch-drive', 'watchDrive');
+  $('#scan-concurrency').addEventListener('change', async (e) => {
+    const v = Math.max(4, Math.min(256, Number(e.target.value) || 48));
+    e.target.value = v;
+    state.settings = await md.settings.set('scanConcurrency', v);
+    toast('Scan concurrency saved', 'info', 1600);
   });
 
   // keyboard: Escape closes whichever modal is open

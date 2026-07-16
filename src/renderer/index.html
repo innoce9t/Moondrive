@@ -122,6 +122,22 @@
             </div>
           </div>
 
+          <!-- Live scan banner (progressive) -->
+          <div class="scan-banner" id="scan-banner" hidden>
+            <div class="scan-banner-spinner"></div>
+            <span class="scan-banner-text">
+              Scanning… <b id="scan-banner-files">0</b> files · <b id="scan-banner-size">0 B</b><span id="scan-banner-reused"></span>
+            </span>
+            <button class="ghost-btn" id="scan-banner-cancel">Cancel</button>
+          </div>
+
+          <!-- Drive-changed nudge -->
+          <div class="drive-changed" id="drive-changed" hidden>
+            <span>This drive changed since the last scan.</span>
+            <button class="mini-primary" id="drive-changed-rescan">Rescan</button>
+            <button class="drive-changed-x" id="drive-changed-dismiss">✕</button>
+          </div>
+
           <!-- Graph controls -->
           <div class="graph-controls">
             <button id="zoom-in" title="Zoom in">＋</button>
@@ -333,10 +349,38 @@
           </div>
 
           <div class="setting-card">
-            <h3>Scanning</h3>
+            <h3>Scanning &amp; performance</h3>
             <label class="switch-row">
               <span>Follow symbolic links <small>(off by default — avoids loops)</small></span>
               <input type="checkbox" id="follow-symlinks" />
+            </label>
+            <label class="switch-row">
+              <span>Skip system paths <small>(recycle bins, /proc, /sys — recommended)</small></span>
+              <input type="checkbox" id="skip-system-paths" />
+            </label>
+            <label class="switch-row">
+              <span>Stay on one drive <small>(don't cross into other mounts / network drives)</small></span>
+              <input type="checkbox" id="same-device" />
+            </label>
+            <label class="switch-row">
+              <span>Dedupe hardlinks <small>(count a hardlinked file's bytes once)</small></span>
+              <input type="checkbox" id="dedup-hardlinks" />
+            </label>
+            <label class="switch-row">
+              <span>Parallel scan (worker threads) <small>(faster on many-core machines)</small></span>
+              <input type="checkbox" id="use-workers" />
+            </label>
+            <label class="switch-row">
+              <span>Fast rescan <small>(reuse folders whose timestamp is unchanged — may miss in-place edits to existing files)</small></span>
+              <input type="checkbox" id="fast-rescan" />
+            </label>
+            <label class="switch-row">
+              <span>Watch drive for changes <small>(nudge to rescan when the folder changes)</small></span>
+              <input type="checkbox" id="watch-drive" />
+            </label>
+            <label class="field">
+              <span>Scan concurrency <small>(in-flight file operations — higher can be faster on SSDs)</small></span>
+              <input type="number" id="scan-concurrency" min="4" max="256" step="4" />
             </label>
           </div>
 

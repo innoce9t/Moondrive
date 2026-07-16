@@ -27,10 +27,21 @@ const api = {
     cancel: () => ipcRenderer.invoke('scan:cancel'),
     duplicates: () => ipcRenderer.invoke('scan:duplicates'),
     junk: () => ipcRenderer.invoke('scan:junk'),
+    getChildren: (folderPath) => ipcRenderer.invoke('scan:getChildren', folderPath),
     onProgress: (cb) => {
       const listener = (_e, data) => cb(data);
       ipcRenderer.on('scan:progress', listener);
       return () => ipcRenderer.removeListener('scan:progress', listener);
+    },
+    onPartial: (cb) => {
+      const listener = (_e, data) => cb(data);
+      ipcRenderer.on('scan:partial', listener);
+      return () => ipcRenderer.removeListener('scan:partial', listener);
+    },
+    onDriveChanged: (cb) => {
+      const listener = (_e, data) => cb(data);
+      ipcRenderer.on('scan:driveChanged', listener);
+      return () => ipcRenderer.removeListener('scan:driveChanged', listener);
     },
   },
 

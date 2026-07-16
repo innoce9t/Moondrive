@@ -16,6 +16,14 @@ class Store {
       geminiApiKey: '',
       geminiModel: 'gemini-2.0-flash',
       followSymlinks: false,
+      // scan performance / behavior
+      scanConcurrency: 48,
+      sameDeviceOnly: false,
+      skipSystemPaths: true,
+      dedupHardlinks: true,
+      fastRescan: false,
+      useWorkers: false,
+      watchDrive: false,
       scanHistory: [], // [{ path, timestamp, files, dirs, totalSize, byCategory }]
     };
     this._load();

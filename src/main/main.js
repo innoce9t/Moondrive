@@ -7,6 +7,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 
 const { ScanSession, findDuplicates, findJunk } = require('./scanner');
+const { ParallelScanSession } = require('./parallel-scan');
 const gemini = require('./gemini');
 const { Store } = require('./store');
 const systemTools = require('./system-tools');
@@ -77,7 +78,18 @@ function registerIpc() {
   ipcMain.handle('settings:getAll', () => store.getAll());
 
   ipcMain.handle('settings:set', (_e, { key, value }) => {
-    const allowed = ['geminiApiKey', 'geminiModel', 'followSymlinks'];
+    const allowed = [
+      'geminiApiKey',
+      'geminiModel',
+      'followSymlinks',
+      'scanConcurrency',
+      'sameDeviceOnly',
+      'skipSystemPaths',
+      'dedupHardlinks',
+      'fastRescan',
+      'useWorkers',
+      'watchDrive',
+    ];
     if (!allowed.includes(key)) throw new Error(`Setting "${key}" is not writable.`);
     store.set(key, value);
     return store.getAll();
@@ -140,22 +152,45 @@ function registerIpc() {
       throw new Error('That folder is outside the sandbox. Grant access to it first.');
     }
     if (activeScan) activeScan.cancel();
+    stopDriveWatch();
 
-    const session = new ScanSession(folderPath, {
-      followSymlinks: store.get('followSymlinks'),
+    const s = store.getAll();
+    const fastRescan = !!s.fastRescan;
+    // Incremental reuse only when rescanning the same root we last scanned.
+    const previousTree =
+      fastRescan && lastScan && lastScan.root && path.resolve(lastScan.root.path) === path.resolve(folderPath)
+        ? lastScan.root
+        : null;
+
+    const options = {
+      followSymlinks: !!s.followSymlinks,
+      concurrency: Number(s.scanConcurrency) || 48,
+      sameDeviceOnly: !!s.sameDeviceOnly,
+      skipSystemPaths: s.skipSystemPaths !== false,
+      dedupHardlinks: s.dedupHardlinks !== false,
+      fastRescan,
+      previousTree,
+      recordDirMtimes: fastRescan, // so this scan's tree carries dir mtimes for next time
       onProgress: (p) => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('scan:progress', p);
+      },
+      // Progressive rendering: stream each completed top-level subtree (shallow).
+      onSubtree: (subtree) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('scan:progress', p);
+          mainWindow.webContents.send('scan:partial', { rootPath: folderPath, child: shallowNode(subtree) });
         }
       },
-    });
+    };
+
+    const session = s.useWorkers
+      ? new ParallelScanSession(folderPath, { ...options, workers: 0 })
+      : new ScanSession(folderPath, options);
     activeScan = session;
 
     try {
       const result = await session.run();
       lastScan = result;
       activeScan = null;
-      // Persist a compact history record for trend tracking.
       store.addScanHistory({
         path: folderPath,
         timestamp: Date.now(),
@@ -164,6 +199,7 @@ function registerIpc() {
         totalSize: result.stats.totalSize,
         byCategory: result.stats.byCategory,
       });
+      if (!result.cancelled) startDriveWatch(folderPath);
       return { ok: true, ...serializeScan(result) };
     } catch (err) {
       activeScan = null;
@@ -174,6 +210,15 @@ function registerIpc() {
   ipcMain.handle('scan:cancel', () => {
     if (activeScan) activeScan.cancel();
     return true;
+  });
+
+  // Lazy tree: the renderer holds only shallow nodes and fetches a folder's
+  // direct children on demand as the user drills in.
+  ipcMain.handle('scan:getChildren', (_e, folderPath) => {
+    if (!lastScan) return { ok: false, error: 'No scan loaded.' };
+    const node = findNodeByPath(lastScan.root, folderPath);
+    if (!node) return { ok: false, error: 'Folder not found in the current scan.' };
+    return { ok: true, path: node.path, children: (node.children || []).map(shallowNode) };
   });
 
   ipcMain.handle('scan:duplicates', async () => {
@@ -237,6 +282,7 @@ function registerIpc() {
       try {
         await fsp.mkdir(path.dirname(mv.to), { recursive: true });
         await fsp.rename(mv.from, mv.to);
+        if (lastScan) removeFromMainTree(lastScan.root, mv.from);
         results.push({ from: mv.from, to: mv.to, ok: true });
         done.push({ from: mv.from, to: mv.to });
       } catch (e) {
@@ -287,6 +333,7 @@ function registerIpc() {
       throw new Error('Refused: path is outside the sandbox.');
     }
     await shell.trashItem(targetPath);
+    if (lastScan) removeFromMainTree(lastScan.root, targetPath);
     return { ok: true };
   });
 
@@ -299,6 +346,7 @@ function registerIpc() {
       }
       try {
         await shell.trashItem(p);
+        if (lastScan) removeFromMainTree(lastScan.root, p);
         results.push({ path: p, ok: true });
       } catch (e) {
         results.push({ path: p, ok: false, error: e.message });
@@ -329,6 +377,12 @@ function registerIpc() {
       throw new Error('Refused: source or destination is outside the sandbox.');
     }
     await fsp.rename(from, to);
+    if (lastScan) {
+      // Same parent = rename (keep node, rewrite paths); different parent = it
+      // left the current subtree, so drop it (reappears on next scan).
+      if (path.dirname(from) === path.dirname(to)) renameInMainTree(lastScan.root, from, to);
+      else removeFromMainTree(lastScan.root, from);
+    }
     return { ok: true };
   });
 
@@ -439,6 +493,42 @@ function findNodeByPath(root, target) {
   return null;
 }
 
+/** Remove a node from the cached tree and subtract its size up the ancestry. */
+function removeFromMainTree(root, targetPath) {
+  const target = path.resolve(targetPath);
+  let removedSize = 0;
+  (function recurse(node) {
+    if (!node.children) return false;
+    const idx = node.children.findIndex((c) => path.resolve(c.path) === target);
+    if (idx !== -1) {
+      removedSize = node.children[idx].size;
+      node.children.splice(idx, 1);
+      node.size -= removedSize;
+      node.childCount = Math.max(0, (node.childCount || 1) - 1);
+      return true;
+    }
+    for (const c of node.children) {
+      if (c.type === 'dir' && recurse(c)) {
+        c.size -= removedSize; // propagate the reduction up
+        return true;
+      }
+    }
+    return false;
+  })(root);
+}
+
+/** Rename a node in the cached tree and rewrite its subtree's paths. */
+function renameInMainTree(root, fromPath, toPath) {
+  const node = findNodeByPath(root, fromPath);
+  if (!node) return;
+  node.name = path.basename(toPath);
+  const from = fromPath;
+  (function rewrite(n) {
+    if (n.path && n.path.startsWith(from)) n.path = toPath + n.path.slice(from.length);
+    if (n.children) n.children.forEach(rewrite);
+  })(node);
+}
+
 /** Strip anything path-like or unsafe from an AI-proposed folder name. */
 function sanitizeFolderName(name) {
   if (!name || typeof name !== 'string') return '';
@@ -492,23 +582,87 @@ function suggestFolders() {
 }
 
 /**
- * The full tree can be huge. We cap what we ship to the renderer: the renderer
- * lazily requests deeper levels via the cached tree if needed. For now we send
- * the whole tree but strip nothing — trees are typically fine in memory. To
- * keep IPC payloads bounded we prune children beyond a depth and mark folders
- * as expandable.
+ * A "shallow" node: everything the renderer needs to draw one node, minus the
+ * children array. `hasChildren` tells the UI a folder can be drilled into; the
+ * children themselves are fetched lazily via scan:getChildren. This keeps the
+ * initial IPC payload tiny even for multi-million-file drives.
+ */
+function shallowNode(node) {
+  return {
+    name: node.name,
+    path: node.path,
+    type: node.type,
+    size: node.size,
+    ext: node.ext || '',
+    category: node.category,
+    mtimeMs: node.mtimeMs,
+    atimeMs: node.atimeMs,
+    allocSize: node.allocSize,
+    childCount: node.childCount || (node.children ? node.children.length : 0),
+    hasChildren: node.type === 'dir' && !!(node.children && node.children.length),
+  };
+}
+
+/**
+ * The full tree stays in main; the renderer receives only the root plus its
+ * direct children (shallow). Deeper levels are pulled on demand as the user
+ * navigates, so the IPC payload and renderer memory stay bounded.
  */
 function serializeScan(result) {
+  const root = result.root;
   return {
-    root: result.root,
+    root: shallowNode(root),
+    children: (root.children || []).map(shallowNode),
     stats: {
       files: result.stats.files,
       dirs: result.stats.dirs,
       totalSize: result.stats.totalSize,
+      totalAllocated: result.stats.totalAllocated,
       errors: result.stats.errors,
+      reused: result.stats.reused,
       byCategory: result.stats.byCategory,
       largest: result.stats.largest.slice(0, 50),
     },
     cancelled: result.cancelled,
   };
+}
+
+// ---- drive watcher (opt-in) ----------------------------------------------
+let driveWatcher = null;
+let driveWatchTimer = null;
+
+function stopDriveWatch() {
+  if (driveWatcher) {
+    try {
+      driveWatcher.close();
+    } catch (e) {
+      /* ignore */
+    }
+    driveWatcher = null;
+  }
+  clearTimeout(driveWatchTimer);
+}
+
+function startDriveWatch(rootPath) {
+  stopDriveWatch();
+  if (!store.get('watchDrive')) return;
+  const notify = () => {
+    clearTimeout(driveWatchTimer);
+    driveWatchTimer = setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('scan:driveChanged', { path: rootPath });
+      }
+    }, 1500);
+  };
+  try {
+    // recursive is supported on macOS/Windows; on Linux it throws and we fall
+    // back to watching the root non-recursively (top-level changes only).
+    driveWatcher = fs.watch(rootPath, { recursive: true }, notify);
+  } catch (e) {
+    try {
+      driveWatcher = fs.watch(rootPath, notify);
+    } catch (e2) {
+      driveWatcher = null;
+    }
+  }
 }
