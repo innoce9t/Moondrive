@@ -2,7 +2,7 @@
 
 const https = require('https');
 
-const DEFAULT_MODEL = 'gemini-2.0-flash';
+const DEFAULT_MODEL = 'gemini-flash-latest';
 const API_HOST = 'generativelanguage.googleapis.com';
 
 /**

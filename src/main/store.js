@@ -14,7 +14,7 @@ class Store {
     this.data = {
       allowedFolders: [], // absolute paths the user has granted
       geminiApiKey: '',
-      geminiModel: 'gemini-2.0-flash',
+      geminiModel: 'gemini-flash-latest',
       followSymlinks: false,
       // scan performance / behavior
       scanConcurrency: 48,

@@ -798,7 +798,12 @@ function autoGrow(el) {
 function hydrateSettings() {
   const s = state.settings;
   $('#gemini-key').value = s.geminiApiKey || '';
-  $('#gemini-model').value = s.geminiModel || 'gemini-2.0-flash';
+  // Coerce any previously-stored (now-removed) model to a valid option.
+  const modelSelect = $('#gemini-model');
+  const validModels = Array.from(modelSelect.options).map((o) => o.value);
+  const model = validModels.includes(s.geminiModel) ? s.geminiModel : 'gemini-flash-latest';
+  modelSelect.value = model;
+  if (model !== s.geminiModel) md.settings.set('geminiModel', model).then((ns) => (state.settings = ns));
   $('#follow-symlinks').checked = !!s.followSymlinks;
   $('#skip-system-paths').checked = s.skipSystemPaths !== false;
   $('#same-device').checked = !!s.sameDeviceOnly;
