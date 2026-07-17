@@ -8,6 +8,11 @@ assistant advising you on what to keep, archive, or delete.
 Black-and-blue dashboard, smooth animations, and safety-first deletions (every
 removal goes to your system Trash, never a hard delete).
 
+![Electron](https://img.shields.io/badge/Electron-2B2E3A?logo=electron&logoColor=9FEAF9)
+![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black)
+![Gemini](https://img.shields.io/badge/Google%20Gemini-8E75B2?logo=googlegemini&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+
 ![Moondrive graph view](docs/graph.png)
 
 ---
@@ -163,3 +168,8 @@ granted-folder list are stored in a local JSON settings file.
 ## License
 
 MIT
+
+## Author
+
+Built by **Ahsan Nawazish** — AI / ML Engineer. A systems-focused desktop project: concurrency-tuned scanning, IPC architecture, security sandboxing, and hand-rolled Canvas visualizations.
+[Portfolio](https://ahsan.live) · [LinkedIn](https://linkedin.com/in/anawazish) · [GitHub](https://github.com/innoce9t)
