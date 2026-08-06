@@ -181,7 +181,7 @@ async function wingetUpgrade(ids, onLine) {
         const parts = buf.split(/\r?\n/);
         buf = parts.pop();
         for (const line of parts) {
-          const clean = line.split('\r').pop();
+          const clean = stripAnsi(line.split('\r').pop());
           if (clean && clean.trim()) onLine && onLine(id, clean);
         }
       };
@@ -199,11 +199,24 @@ async function wingetUpgrade(ids, onLine) {
 // Startup apps (Windows)
 // ------------------------------------------------------------
 function ps(script, timeout = 30000) {
+  // Force UTF-8 output so Node decodes PowerShell's stdout correctly regardless
+  // of the machine's console code page (Windows PowerShell 5.1 otherwise emits
+  // in the OEM/ANSI page, which mangles non-ASCII names/paths).
+  const utf8Prefix = '$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ';
   return run(
     'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', utf8Prefix + script],
     { timeout }
   );
+}
+
+/** Parse JSON from PowerShell stdout, tolerating a UTF-8 BOM and stray escapes. */
+function parsePsJson(stdout) {
+  let out = stripAnsi(String(stdout || '')).trim();
+  if (out.charCodeAt(0) === 0xfeff) out = out.slice(1); // strip BOM
+  if (!out) return [];
+  const json = JSON.parse(out);
+  return Array.isArray(json) ? json : [json];
 }
 
 const LIST_STARTUP_SCRIPT = `
@@ -258,11 +271,7 @@ async function listStartupApps() {
   }
   let parsed = [];
   try {
-    const out = (res.stdout || '').trim();
-    if (out) {
-      const json = JSON.parse(out);
-      parsed = Array.isArray(json) ? json : [json];
-    }
+    parsed = parsePsJson(res.stdout);
   } catch (e) {
     return { supported: true, items: [], error: 'Could not parse startup entries.' };
   }
@@ -351,11 +360,7 @@ async function listInstalledApps() {
   }
   let parsed = [];
   try {
-    const out = (res.stdout || '').trim();
-    if (out) {
-      const json = JSON.parse(out);
-      parsed = Array.isArray(json) ? json : [json];
-    }
+    parsed = parsePsJson(res.stdout);
   } catch (e) {
     return { supported: true, items: [], error: 'Could not parse installed apps.' };
   }
@@ -394,14 +399,15 @@ async function uninstallApp(app, onLine) {
   if (!cmd) return { supported: true, ok: false, error: 'No uninstall command is registered for this app.' };
 
   return new Promise((resolve) => {
-    const child = spawn('cmd.exe', ['/c', cmd], { windowsHide: true });
+    // chcp 65001 so any UTF-8 output from the vendor uninstaller reads cleanly.
+    const child = spawn('cmd.exe', ['/d', '/s', '/c', `chcp 65001 >nul & ${cmd}`], { windowsHide: true });
     let buf = '';
     const push = (chunk) => {
       buf += chunk.toString();
       const parts = buf.split(/\r?\n/);
       buf = parts.pop();
       for (const line of parts) {
-        const clean = line.split('\r').pop();
+        const clean = stripAnsi(line.split('\r').pop());
         if (clean && clean.trim()) onLine && onLine(clean);
       }
     };
@@ -418,6 +424,8 @@ module.exports = {
   wingetListUpgrades,
   wingetUpgrade,
   parseWingetUpgrade, // exported for testing
+  parsePsJson, // exported for testing
+  stripAnsi, // exported for testing
   listStartupApps,
   setStartupApp,
   listInstalledApps,
