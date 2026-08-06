@@ -27,12 +27,21 @@ function run(cmd, args, { timeout = 60000, env } = {}) {
   });
 }
 
-/** Strip carriage-return progress redraws and spinner/progress-bar noise. */
+// Matches ANSI/VT escape sequences winget emits (colours, cursor moves) even
+// when its output is piped — these otherwise corrupt column alignment.
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
+
+function stripAnsi(s) {
+  return s.replace(ANSI_RE, '');
+}
+
+/** Strip escape sequences, carriage-return redraws, and progress-bar noise. */
 function cleanConsole(text) {
   return text
     .split('\n')
-    .map((line) => line.split('\r').pop()) // keep only the final redraw of each line
-    .filter((line) => !/^[\s█░▒▓\-\\|/]*$/.test(line) || line.trim() === '')
+    .map((line) => stripAnsi(line.split('\r').pop())) // final redraw of each line, no escapes
+    .filter((line) => !/^[\s█░▒▓·\-─\\|/]*$/.test(line) || line.trim() === '')
     .join('\n');
 }
 
@@ -49,9 +58,11 @@ async function wingetAvailable() {
 }
 
 /**
- * Parse the fixed-width table produced by `winget upgrade`. winget aligns
- * columns to header positions, so we slice each row by the header indices
- * rather than splitting on whitespace (names/ids can contain spaces).
+ * Parse the table produced by `winget upgrade`. winget separates columns with
+ * runs of 2+ spaces and pads them, so splitting on /\s{2,}/ recovers the fields
+ * reliably — a name's own single spaces stay intact, while column gaps split.
+ * This is far more robust than slicing by header character positions, which
+ * breaks when piped output uses a different code page or carries escape codes.
  */
 function parseWingetUpgrade(raw) {
   const text = cleanConsole(raw);
@@ -59,7 +70,8 @@ function parseWingetUpgrade(raw) {
 
   let headerIdx = -1;
   for (let i = 0; i < lines.length; i++) {
-    if (/\bName\b/.test(lines[i]) && /\bId\b/.test(lines[i]) && /\bVersion\b/.test(lines[i]) && /\bAvailable\b/.test(lines[i])) {
+    const l = lines[i];
+    if (/(^|\s)Name(\s|$)/.test(l) && /\bId\b/.test(l) && /\bVersion\b/.test(l) && /\bAvailable\b/.test(l)) {
       headerIdx = i;
       break;
     }
@@ -71,23 +83,45 @@ function parseWingetUpgrade(raw) {
   const iVersion = header.indexOf('Version');
   const iAvailable = header.indexOf('Available');
   const iSource = header.indexOf('Source');
+  const canSlice = iId > 0 && iVersion > iId && iAvailable > iVersion;
 
   const items = [];
   for (let i = headerIdx + 1; i < lines.length; i++) {
     const line = lines[i];
     const t = line.trim();
     if (!t) continue;
-    if (/^[-─\s]+$/.test(t)) continue; // separator row
-    if (/upgrades?\s+available/i.test(t) || /package\(s\)/i.test(t)) break;
-    if (t.length < iId) continue;
+    if (/^[-─=\s]+$/.test(t)) continue; // separator row
+    if (/^\d+\s+(package|upgrade)/i.test(t)) break; // "N upgrades available." footer
+    if (/have version numbers that cannot be determined/i.test(t)) continue;
 
-    const name = line.slice(0, iId).trim();
-    const id = line.slice(iId, iVersion).trim();
-    const version = line.slice(iVersion, iAvailable).trim();
-    const available = line.slice(iAvailable, iSource > -1 ? iSource : undefined).trim();
-    const source = iSource > -1 ? line.slice(iSource).trim() : '';
-    if (id && available && !/^Version$/i.test(version)) {
-      items.push({ name: name || id, id, version, available, source });
+    let name;
+    let id;
+    let version;
+    let available;
+    let source = '';
+
+    // Primary: slice by the header's column positions. This survives winget's
+    // truncated long names ("…"), which leave only one space before the Id.
+    if (canSlice && line.length >= iAvailable) {
+      name = line.slice(0, iId).trim();
+      id = line.slice(iId, iVersion).trim();
+      version = line.slice(iVersion, iAvailable).trim();
+      available = line.slice(iAvailable, iSource > iAvailable ? iSource : undefined).trim();
+      source = iSource > iAvailable ? line.slice(iSource).trim() : '';
+    }
+
+    // Fallback: if slicing looks wrong (ids/versions never contain spaces),
+    // split on runs of 2+ spaces instead.
+    if (!id || /\s/.test(id) || !available || /\s/.test(available)) {
+      const cols = t.split(/\s{2,}/);
+      if (cols.length >= 4) {
+        [name, id, version, available, source] = cols;
+        source = source || '';
+      }
+    }
+
+    if (id && available && !/\s/.test(id)) {
+      items.push({ name: name || id, id, version: version || '', available, source: source || '' });
     }
   }
   return items;
@@ -97,12 +131,23 @@ async function wingetListUpgrades() {
   const avail = await wingetAvailable();
   if (!avail.supported) return { supported: false, reason: avail.reason, items: [] };
 
+  // Run through cmd with `chcp 65001` so winget emits UTF-8 that Node decodes
+  // correctly regardless of the machine's default console code page.
   const res = await run(
-    'winget',
-    ['upgrade', '--include-unknown', '--accept-source-agreements', '--disable-interactivity'],
-    { timeout: 120000, env: { WINGET_DISABLE_INTERACTIVITY: '1' } }
+    'cmd.exe',
+    ['/d', '/s', '/c', 'chcp 65001 >nul & winget upgrade --include-unknown --accept-source-agreements --disable-interactivity'],
+    { timeout: 120000 }
   );
-  const items = parseWingetUpgrade(res.stdout || res.stderr);
+  let items = parseWingetUpgrade(res.stdout || '');
+  // Fallback: some winget builds reject --disable-interactivity; retry without it.
+  if (!items.length && /--disable-interactivity|unexpected argument|Unrecognized/i.test(res.stdout + res.stderr)) {
+    const res2 = await run(
+      'cmd.exe',
+      ['/d', '/s', '/c', 'chcp 65001 >nul & winget upgrade --include-unknown --accept-source-agreements'],
+      { timeout: 120000 }
+    );
+    items = parseWingetUpgrade(res2.stdout || '');
+  }
   return { supported: true, items };
 }
 
